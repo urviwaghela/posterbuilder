@@ -1,0 +1,2092 @@
+// ILDC poster builder: Airtable → posters → Airtable + Wix.
+//
+//   node sync.mjs            normal run (what GitHub runs every hour)
+//   node sync.mjs --all      redraw every poster even if nothing changed
+//
+// Needs four environment variables (GitHub "secrets"):
+//   AIRTABLE_TOKEN, AIRTABLE_BASE_ID, WIX_API_KEY, WIX_SITE_ID
+//
+// What it does, in order:
+//   1. Reads the Sessions, Registrations and Organisers tables.
+//   2. For every speaker linked to a session: makes the standard cut-out headshot once per photo
+//      (re-used afterwards; a new photo in Airtable triggers a new crop) and writes it back to
+//      "Poster photo", with any warnings in "Photo check".
+//   3. Draws each session's poster when something on it changed, saves it to "Poster",
+//      and writes problems to "Poster status" and the time to "Last built".
+//   4. Sessions with "Publish" ticked are copied to the Wix CMS collection that the website reads;
+//      unticking Publish takes the session off the website.
+//   5. Writes output/programme.pdf with all published posters (downloadable from the GitHub run).
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { airtable } from './airtable.mjs';
+import { wix } from './wix.mjs';
+import { startEngine, mimeOf } from './engine.mjs';
+import { writeProgrammeDoc } from './programme_doc.mjs';
+
+// ---------- Names of tables and fields in Airtable (change here if you rename them) ----------
+const T = { sessions: 'Sessions', people: 'Registrations', orgs: 'Organisers' };
+const F = {
+  // Sessions
+  code: 'Session code', number: 'Session number', title: 'Title', date: 'Date', start: 'Start time', end: 'End time',
+  room: 'Room', venue: 'Venue', about: 'About', themes: ['Themes', 'Theme 1, Theme 2, Theme 3, Theme 4'],
+  speakers: 'Panelists', chair: 'Chair', moderator: 'Moderator',   // Chair and Moderator are optional link fields
+  organisers: 'Organisers', colour: 'Colour', publish: 'Publish',
+  poster: 'Poster', status: 'Poster status', built: 'Last built',
+  // Registrations
+  name: 'Name', honorific: 'Title', designation: 'Designation', organisation: 'Organization', photo: 'Photo', capacity: 'Attending capacity', bio: 'Bio',
+  regCode: 'Unique Code',                       // optional; the Airtable record id is used if missing
+  posterPhoto: 'Poster photo', photoCheck: 'Photo check',
+  // Organisers
+  orgName: 'Name', logo: 'Logo',
+};
+const WIX_COLLECTION = 'ConferenceSessions', WIX_SPEAKERS = 'ConferenceSpeakers', WIX_REF = 'speakerList';
+const DAY_ZERO = '2026-11-16';   // pre-conference day = Day 0, 17 Nov = Day 1 …
+// Poster colour follows the day (Day 0 and anything else: purple).
+const DAY_COLOUR = { '2026-11-17': 'purple', '2026-11-18': 'mustard', '2026-11-19': 'green' };
+const dayLabel = iso => iso ? `Day ${Math.round((Date.parse(iso) - Date.parse(DAY_ZERO)) / 864e5)}` : '';
+const MODERATOR = /moderator|chair/i;
+// Role tag shown on the poster and the website, from the Registrations "Attending capacity" field.
+const roleOf = c => MODERATOR.test(c) ? 'Moderator' : /paper/i.test(c) ? 'Paper Presenter' : /panel/i.test(c) ? 'Panelist' : 'Speaker';
+const MAX_SPEAKERS = 10;
+
+const root = path.dirname(new URL(import.meta.url).pathname);
+const work = path.join(root, 'work');
+const FORCE = process.argv.includes('--all');
+const env = k => { const v = process.env[k]; if (!v) { console.error(`Missing setting ${k}. Add it under GitHub → Settings → Secrets and variables → Actions.`); process.exit(1); } return v.trim(); };
+
+const AT = airtable({ token: env('AIRTABLE_TOKEN'), baseId: env('AIRTABLE_BASE_ID'), apiBase: process.env.AIRTABLE_API_BASE });
+const WX = wix({ apiKey: env('WIX_API_KEY'), siteId: env('WIX_SITE_ID'), apiBase: process.env.WIX_API_BASE });
+
+const log = (...a) => console.log(...a);
+const sha = s => crypto.createHash('sha1').update(s).digest('hex');
+const att = v => (Array.isArray(v) && v.length ? v[0] : null);            // first attachment
+const str = v => (v == null ? '' : Array.isArray(v) ? v.join(', ') : typeof v === 'object' ? (v.name ?? '') : String(v)).trim();
+async function download(url) { const r = await fetch(url); if (!r.ok) throw new Error(`download failed (${r.status})`); return Buffer.from(await r.arrayBuffer()); }
+const write = (rel, buf) => { const p = path.join(work, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, buf); return '/work/' + rel; };
+
+// Names: tidy spaces, drop titles typed into the name ("Dr. X" → "X"); titles are not shown on posters.
+// Titles shown before a name: Dr and Prof only (from the Registrations "Title" field, or written into the name itself).
+const SHOW_TITLES = { dr: 'Dr', prof: 'Prof', professor: 'Prof' };
+const honorific = fields => { const raw = str(fields['Title']) || (str(fields['Name']).match(/^\s*(dr|prof|professor)\b/i) || [])[1] || '';
+  return SHOW_TITLES[raw.replace(/\./g, '').trim().toLowerCase()] || ''; };
+// Names always in title case ("ANITA RAO" / "anita rao" → "Anita Rao"); short initials without vowels stay as they are ("BK").
+const titleCaseWord = w => /^[B-DF-HJ-NP-TV-Z]{2,3}$/.test(w) ? w : w.toLowerCase().replace(/(^|[-'’.])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
+const cleanName = n => str(n).replace(/\s+/g, ' ').replace(/^(dr|prof|mr|mrs|ms|smt|shri)(\.\s*|\s+)/i, '').trim().split(' ').map(titleCaseWord).join(' ');
+// Every title for the programme agenda (Mr, Ms, Dr, Prof …), from the Registrations "Title" field.
+const ALL_TITLES = { dr: 'Dr', prof: 'Prof', professor: 'Prof', mr: 'Mr', ms: 'Ms', mrs: 'Mrs', smt: 'Smt', shri: 'Shri', miss: 'Miss' };
+const anyTitle = fields => { const raw = (str(fields['Title']) || (str(fields['Name']).match(/^\s*(dr|prof|professor|mr|mrs|ms|smt|shri|miss)\b/i) || [])[1] || '').replace(/\./g, '').trim();
+  return ALL_TITLES[raw.toLowerCase()] || (/^no\b|^none$|^-$/i.test(raw) ? '' : raw); };
+function fmtTime(t) {
+  t = str(t); if (!t) return '';
+  const m = t.match(/^(\d{1,2})[:.](\d{2})\s*(am|pm)?$/i); if (!m) return t;
+  let h = +m[1]; const ap = m[3] ? m[3].toUpperCase() : (h >= 12 ? 'PM' : 'AM');
+  if (!m[3]) h = h % 12 || 12;
+  return `${h}:${m[2]} ${ap}`;
+}
+const fmtDate = iso => iso ? new Date(iso + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }) : '';
+const sortTime = t => { const m = str(t).match(/^(\d{1,2})[:.](\d{2})\s*(am|pm)?$/i); if (!m) return '99:99'; let h = +m[1]; if (m[3]?.toLowerCase() === 'pm' && h < 12) h += 12; if (m[3]?.toLowerCase() === 'am' && h === 12) h = 0; return String(h).padStart(2, '0') + ':' + m[2]; };
+
+async function main() {
+  const t0 = Date.now();
+  fs.rmSync(work, { recursive: true, force: true });
+  fs.mkdirSync(path.join(root, 'output'), { recursive: true });
+
+  // ---- 0. Check the base has the fields we expect, with a readable message if not ----
+  const schema = await AT.schema();
+  const problems = [];
+  const need = {
+    [T.sessions]: [F.code, F.title, F.date, F.start, F.end, F.room, F.venue, F.about, F.speakers, F.organisers, F.publish, F.poster, F.status, F.built],
+    [T.people]: [F.name, F.designation, F.organisation, F.photo, F.capacity, F.bio, F.posterPhoto, F.photoCheck],
+    [T.orgs]: [F.orgName, F.logo],
+  };
+  for (const [table, fields] of Object.entries(need)) {
+    if (!schema[table]) { problems.push(`Table "${table}" not found. Tables in the base: ${Object.keys(schema).join(', ')}`); continue; }
+    for (const f of fields) if (!schema[table].fields[f]) problems.push(`Field "${f}" not found in table "${table}".`);
+  }
+  const themeField = F.themes.find(f => schema[T.sessions]?.fields[f]);
+  if (problems.length) { console.error('Setup problems:\n - ' + problems.join('\n - ')); process.exit(1); }
+  const builtIsDate = /date/i.test(schema[T.sessions].fields[F.built].type);
+
+  // ---- 1. Read the tables ----
+  const [sessions, people, orgs] = await Promise.all([AT.list(T.sessions), AT.list(T.people), AT.list(T.orgs)]);
+  const personById = new Map(people.map(r => [r.id, r]));
+  const orgById = new Map(orgs.map(r => [r.id, r]));
+  const live = sessions.filter(s => str(s.fields[F.code]) || str(s.fields[F.title]));
+  log(`Read ${live.length} sessions, ${people.length} registrations, ${orgs.length} organisers.`);
+
+  const engine = await startEngine(root);
+  const report = [];
+  try {
+    // ---- 2. Headshots for everyone linked to a session ----
+    const linked = new Set(live.flatMap(s => s.fields[F.speakers] || []));
+    const photoOf = new Map();       // person record id → { path, key, flags }
+    const personUpdates = [];
+    for (const pid of linked) {
+      const p = personById.get(pid); if (!p) continue;
+      const src = att(p.fields[F.photo]);
+      if (!src) { photoOf.set(pid, { path: null, key: 'none', flags: ['no photo uploaded'] }); continue; }
+      const cachedName = `headshot_${src.id}.png`;            // the source attachment's id: a new photo gives a new id
+      const cached = (p.fields[F.posterPhoto] || []).find(a => a.filename === cachedName);
+      try {
+        if (cached && !FORCE) {
+          const prev = str(p.fields[F.photoCheck]);
+          const flags = prev && prev !== 'OK' ? prev.split('; ').filter(Boolean) : [];
+          photoOf.set(pid, { path: write(`photos/${pid}.png`, await download(cached.url)), key: src.id, flags });
+          continue;
+        }
+        log(`  photo: ${str(p.fields[F.name])}`);
+        const r = await engine.headshot(await download(src.url), src.filename, src.type || mimeOf(src.filename));
+        if (Array.isArray(p.fields[F.photo]) && p.fields[F.photo].length > 1) r.flags.push(`${p.fields[F.photo].length} photos uploaded – the first one is used`);
+        if (!r.png) { photoOf.set(pid, { path: null, key: src.id, flags: r.flags }); personUpdates.push({ id: pid, fields: { [F.photoCheck]: r.flags.join('; ') } }); continue; }
+        const up = await WX.upload(r.png, cachedName, 'image/png');
+        photoOf.set(pid, { path: write(`photos/${pid}.png`, r.png), key: src.id, flags: r.flags, wix: up });
+        personUpdates.push({ id: pid, fields: { [F.posterPhoto]: [{ url: up.url, filename: cachedName }], [F.photoCheck]: r.flags.length ? r.flags.join('; ') : 'OK' } });
+      } catch (e) {
+        const msg = String(e.message || e).slice(0, 200);
+        photoOf.set(pid, { path: null, key: src.id, flags: [msg] });
+        personUpdates.push({ id: pid, fields: { [F.photoCheck]: msg } });
+      }
+    }
+    if (personUpdates.length) await AT.update(T.people, personUpdates);
+
+    // ---- Logos ----
+    const logoOf = new Map();
+    for (const oid of new Set(live.flatMap(s => s.fields[F.organisers] || []))) {
+      const o = orgById.get(oid); const src = o && att(o.fields[F.logo]);
+      if (!src) continue;
+      try {
+        const r = await engine.logo(await download(src.url), src.filename, src.type || mimeOf(src.filename));
+        logoOf.set(oid, { path: write(`logos/${oid}.png`, r.png), aspect: r.aspect, key: src.id });
+      } catch (e) { log(`  logo problem (${str(o.fields[F.orgName])}): ${e.message}`); }
+    }
+
+    // ---- 3. Posters ----
+    const template = sha(['poster.html', 'banner.html', 'banner_mobile.html', 'logos.html'].map(f => fs.readFileSync(path.join(root, f), 'utf8')).join() + fs.readdirSync(root).filter(f => f.endsWith('.png')).join());
+    const wixItems = new Map((await WX.queryAll(WIX_COLLECTION)).map(i => [str(i.data.sessionCode), i]));
+    const sessionUpdates = [], published = [], docRows = [];
+    const leadRole = new Map();   // person id → 'Chair' / 'Moderator' from the sessions' own fields
+    const now = new Date();
+
+    for (const s of live) {
+      const f = s.fields, code = str(f[F.code]) || s.id;
+      const status = [];
+      if (!str(f[F.title])) status.push('Title is empty');
+      if (!f[F.date]) status.push('Date is empty');
+      if (!str(f[F.start]) || !str(f[F.end])) status.push('Start or end time is empty');
+      if (!str(f[F.room])) status.push('Room is empty');
+      // Codes are day · slot · room (111 = Day 1, slot 1, room 1): the first digit must match the date.
+      if (/^\d{3}$/.test(code) && f[F.date]) {
+        const dateDay = Math.round((Date.parse(f[F.date]) - Date.parse(DAY_ZERO)) / 864e5);
+        if (+code[0] !== dateDay) status.push(`Code ${code} says Day ${code[0]} but the date (${fmtDate(f[F.date])}) is Day ${dateDay}`);
+      }
+
+      const mk = (pid, role) => {
+        const p = personById.get(pid); if (!p) return null;
+        const ph = photoOf.get(pid) || { path: null, key: 'none', flags: [] };
+        const name = [honorific(p.fields), cleanName(p.fields[F.name])].filter(Boolean).join(' ');
+        ph.flags.forEach(x => status.push(`${name}: ${x}`));
+        if (!str(p.fields[F.organisation])) status.push(`${name}: no organisation`);
+        return { id: pid, name, docName: [anyTitle(p.fields), cleanName(p.fields[F.name])].filter(Boolean).join(' '),
+          designation: str(p.fields[F.designation]), organisation: str(p.fields[F.organisation]),
+          role: role || roleOf(str(p.fields[F.capacity])), photo: ph.path, photoKey: ph.key };
+      };
+      // Chair and Moderator come from the session's own link fields when either is filled;
+      // otherwise moderators are found from "Attending capacity" as before.
+      const chairIds = f[F.chair] || [], modIds = (f[F.moderator] || []).filter(id => !chairIds.includes(id));
+      let speakers;
+      if (chairIds.length || modIds.length) {
+        const lead = new Set([...chairIds, ...modIds]);
+        chairIds.forEach(id => leadRole.set(id, 'Chair')); modIds.forEach(id => { if (!leadRole.has(id)) leadRole.set(id, 'Moderator'); });
+        speakers = [...chairIds.map(id => mk(id, 'Chair')), ...modIds.map(id => mk(id, 'Moderator')),
+          ...(f[F.speakers] || []).filter(id => !lead.has(id)).map(id => { const x = mk(id); if (x && x.role === 'Moderator') x.role = 'Panelist'; return x; })].filter(Boolean);
+      } else {
+        speakers = (f[F.speakers] || []).map(id => mk(id)).filter(Boolean);
+        speakers = [...speakers.filter(x => x.role === 'Moderator'), ...speakers.filter(x => x.role !== 'Moderator')];   // moderators first
+      }
+      if (str(f[F.code]) && f[F.date]) docRows.push({ code, date: f[F.date], title: str(f[F.title]),
+        organisers: (f[F.organisers] || []).map(oid => str(orgById.get(oid)?.fields[F.orgName])).filter(Boolean),
+        chairs: speakers.filter(x => x.role === 'Chair'), moderators: speakers.filter(x => x.role === 'Moderator'),
+        speakers: speakers.filter(x => x.role !== 'Chair' && x.role !== 'Moderator') });
+      if (!speakers.length) status.push('No speakers linked yet');
+      if (speakers.length > MAX_SPEAKERS) status.push(`${speakers.length} speakers – a poster holds at most ${MAX_SPEAKERS}`);
+
+      const logos = (f[F.organisers] || []).map(oid => {
+        const o = orgById.get(oid), l = logoOf.get(oid);
+        if (!l) { status.push(`${str(o?.fields[F.orgName]) || 'An organiser'}: no logo`); return null; }
+        return { name: str(o.fields[F.orgName]), src: l.path, aspect: l.aspect, key: l.key };
+      }).filter(Boolean);
+
+      const colour = DAY_COLOUR[f[F.date]] || 'purple';
+      const themes = themeField ? str(f[themeField]).split(/\r?\n/).map(x => x.replace(/^[\s•\-–\d.)]+/, '').trim()).filter(Boolean).slice(0, 4) : [];
+      const data = {
+        sessionNo: str(f[F.number]) || (code.match(/\d+/)?.[0] ?? ''), title: str(f[F.title]), colour, colourway: colour,
+        date: fmtDate(f[F.date]), time: [fmtTime(f[F.start]), fmtTime(f[F.end])].filter(Boolean).join(' – '),
+        room: str(f[F.room]), venue: str(f[F.venue]), about: str(f[F.about]), themes,
+        speakers: speakers.map(({ id, photoKey, ...x }) => x), logos: logos.map(({ key, ...x }) => x), showDesignation: true,
+        art: fs.existsSync(path.join(root, `art_${colour}.png`)) ? `/art_${colour}.png` : '/art_purple.png',
+        confLogo: '/ildc_emblem.png', wordmark: '/ildc_wordmark_white.png',
+      };
+      // Fingerprint of everything that appears on the poster; unchanged fingerprint = nothing to redraw.
+      const key = sha(JSON.stringify({ template, data: { ...data, speakers: speakers.map(x => [x.name, x.designation, x.organisation, x.role, x.photoKey]), logos: logos.map(l => l.key) } })).slice(0, 10);
+      const posterName = `${code}_${key}.png`;
+      const current = (f[F.poster] || []).find(a => a.filename === posterName);
+      const canDraw = speakers.length > 0 && speakers.length <= MAX_SPEAKERS;
+
+      let posterPath = null, wixPoster = null, warnings = [];
+      if (canDraw && (!current || FORCE)) {
+        data.stamp = `${code} · updated ${now.toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`;
+        const r = await engine.render(data);
+        warnings = r.warnings.filter(w => !/no approved photo/.test(w));
+        posterPath = write(`posters/${code}.png`, r.png);
+        wixPoster = await WX.upload(r.png, posterName, 'image/png');
+        log(`  drew ${code}`);
+      } else if (canDraw && current) {
+        posterPath = write(`posters/${code}.png`, await download(current.url));
+      }
+      const statusText = [...new Set([...status, ...warnings])].map(x => '• ' + x).join('\n') || 'OK';
+
+      const upd = {};
+      if (wixPoster) {
+        upd[F.poster] = [{ url: wixPoster.url, filename: posterName }];
+        upd[F.built] = builtIsDate ? now.toISOString() : now.toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }) + ' IST';
+      }
+      if (str(f[F.status]) !== statusText) upd[F.status] = statusText;
+      if (Object.keys(upd).length) sessionUpdates.push({ id: s.id, fields: upd });
+      report.push(`${code}  ${str(f[F.title])}\n${statusText.split('\n').map(x => '    ' + x).join('\n')}`);
+
+      if (f[F.publish] && canDraw) {
+        const sort = `${f[F.date] || '9999'} ${sortTime(f[F.start])} ${code}`;
+        const bannerData = { colourway: colour, art: data.art, confLogo: data.confLogo, kicker: [`Session ${data.sessionNo || code}`, dayLabel(f[F.date])].filter(Boolean).join(' · '),
+          title: data.title, date: data.date, time: data.time, room: data.room, venue: data.venue, logos: data.logos };
+        published.push({ code, sort, path: posterPath, posterName, wixPoster, posterKey: key, speakerIds: speakers.map(x => x.id), bannerData, logoList: data.logos,
+          wd: {
+            title: str(f[F.title]), sessionCode: code, date: f[F.date] || null,
+            day: dayLabel(f[F.date]),
+            dateLabel: f[F.date] ? new Date(f[F.date] + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }) : '',
+            speakerCount: `${speakers.length} speaker${speakers.length === 1 ? '' : 's'}`,
+            themesText: themes.join('\n'),
+            startTime: str(f[F.start]), endTime: str(f[F.end]), timeLabel: data.time, sortKey: sort,
+            room: data.room, venue: data.venue, about: data.about, themes,
+            speakers: speakers.map(x => [`${x.name} (${x.role})`, x.designation, x.organisation].filter(Boolean).join(', ')).join('\n'),
+            organisers: logos.map(l => l.name).join(', '), colour,
+          } });
+      }
+    }
+    if (sessionUpdates.length) await AT.update(T.sessions, sessionUpdates);
+
+    // ---- 4. Website: speakers first (sessions link to them), then sessions ----
+    const wixSpeakers = new Map((await WX.queryAll(WIX_SPEAKERS)).map(i => [str(i.data.regCode), i]));
+    const speakerItemId = new Map();          // person record id → Wix item id
+    // Fixed website images (day background, landscape strip, moderator tag): uploaded once per run, only if something is written.
+    const assetCache = {};
+    const webAsset = name => assetCache[name] ??= WX.upload(fs.readFileSync(path.join(root, name)), name, name.endsWith('.jpg') ? 'image/jpeg' : 'image/png');
+    const WEB_VERSION = 'web2';   // bump when the fixed images change, so every item is rewritten
+
+    const wanted = new Set(published.flatMap(p => p.speakerIds));
+    for (const pid of wanted) {
+      const p = personById.get(pid), ph = photoOf.get(pid) || {};
+      const regCode = str(p.fields[F.regCode]) || pid;
+      const sd = { title: [honorific(p.fields), cleanName(p.fields[F.name])].filter(Boolean).join(' '), designation: str(p.fields[F.designation]), organisation: str(p.fields[F.organisation]),
+        bio: str(p.fields[F.bio]), role: leadRole.get(pid) || roleOf(str(p.fields[F.capacity])), regCode };
+      sd.affiliation = [sd.designation, sd.organisation].filter(Boolean).join(', ');
+      const k = sha(JSON.stringify(sd) + (ph.key || '') + WEB_VERSION).slice(0, 10);
+      let item = wixSpeakers.get(regCode);
+      if (!item || item.data.buildKey !== k) {
+        let photo = ph.wix;
+        if (!photo && ph.path) photo = await WX.upload(fs.readFileSync(path.join(root, ph.path)), `headshot_${ph.key}.png`, 'image/png');
+        const tag = await webAsset(sd.role === 'Moderator' ? 'tag_moderator.png' : sd.role === 'Chair' ? 'tag_chair.png' : 'tag_none.png');
+        const full = { ...sd, photo: photo ? photo.uri : null, roleTag: tag.uri, buildKey: k };
+        const r = item ? await WX.replace(WIX_SPEAKERS, item.id, full) : await WX.insert(WIX_SPEAKERS, full);
+        item = r.dataItem || item;
+        log(`  website: ${wixSpeakers.has(regCode) ? 'updated' : 'added'} speaker ${sd.title}`);
+      }
+      speakerItemId.set(pid, item.id);
+    }
+    const keepCodes = new Set([...wanted].map(pid => str(personById.get(pid).fields[F.regCode]) || pid));
+    for (const [code, item] of wixSpeakers) if (!keepCodes.has(code)) { await WX.remove(WIX_SPEAKERS, item.id); log(`  website: removed speaker ${item.data.title}`); }
+
+    const publishedCodes = new Set(published.map(p => p.code));
+    for (const p of published) {
+      const ids = p.speakerIds.map(id => speakerItemId.get(id));
+      const k = sha(p.posterKey + ids.join() + JSON.stringify(p.wd) + WEB_VERSION).slice(0, 10);
+      const item = wixItems.get(p.code);
+      if (item && item.data.buildKey === k) continue;
+      let poster = p.wixPoster;
+      if (!poster) poster = await WX.upload(fs.readFileSync(path.join(root, p.path)), p.posterName, 'image/png');
+      // Landscape banner and organiser-logo row for the session page.
+      const banner = await WX.upload(await engine.banner(p.bannerData), `${p.code}_${k}_banner.png`, 'image/png');
+      const bannerM = await WX.upload(await engine.bannerMobile(p.bannerData), `${p.code}_${k}_banner_mobile.png`, 'image/png');
+      const logoRow = p.logoList.length ? await WX.upload(await engine.logoRow(p.logoList), `${p.code}_${k}_logos.png`, 'image/png') : null;
+      const full = { ...p.wd, poster: poster.uri, posterUrl: poster.url, banner: banner.uri, bannerMobile: bannerM.uri, organiserLogos: logoRow ? logoRow.uri : null,
+        dayBackground: (await webAsset(`bg_${p.wd.colour}.png`)).uri, dayStrip: (await webAsset(`strip_${p.wd.colour}.jpg`)).uri,
+        buildKey: k, lastUpdated: { $date: new Date().toISOString() } };
+      const r = item ? await WX.replace(WIX_COLLECTION, item.id, full) : await WX.insert(WIX_COLLECTION, full);
+      await WX.replaceRefs(WIX_COLLECTION, item ? item.id : r.dataItem.id, WIX_REF, ids);
+      log(`  website: ${item ? 'updated' : 'added'} session ${p.code}`);
+    }
+    for (const [code, item] of wixItems) if (!publishedCodes.has(code)) { await WX.remove(WIX_COLLECTION, item.id); log(`  website: removed session ${code} (Publish unticked)`); }
+
+    // ---- 5. Programme PDF (published sessions, in date/time order) ----
+    published.sort((a, b) => a.sort.localeCompare(b.sort));
+    if (published.length) await engine.programme(published.map(p => p.path.replace(/^\//, '')), path.join(root, 'output/programme.pdf'));
+
+    // ---- 6. Programme agenda (Word), every session with a code and a date, timestamped ----
+    const ist = new Date(Date.now() + 5.5 * 3600e3).toISOString();   // IST clock time
+    const stamp = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' IST';
+    const byDate = new Map();
+    for (const r of docRows) { if (!byDate.has(r.date)) byDate.set(r.date, []); byDate.get(r.date).push(r); }
+    const days = [...byDate.keys()].sort().map(date => ({
+      label: `${dayLabel(date)} · ${new Date(date + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' })}`,
+      colour: DAY_COLOUR[date] || 'purple',
+      sessions: byDate.get(date).sort((a, b) => a.code.localeCompare(b.code, 'en', { numeric: true })) }));
+    if (days.length) {
+      const docName = `ILDC2026_Programme_Agenda_${ist.slice(0, 10)}_${ist.slice(11, 16).replace(':', '')}IST.docx`;
+      await writeProgrammeDoc(path.join(root, 'output', docName), days, stamp);
+      log(`  programme agenda: ${docName}`);
+    }
+  } finally {
+    await engine.close();
+  }
+  const txt = report.join('\n');
+  fs.writeFileSync(path.join(root, 'output/report.txt'), txt + '\n');
+  log('\n' + txt + `\n\nDone in ${Math.round((Date.now() - t0) / 1000)}s.`);
+}
+
+main().catch(e => { console.error('\nBUILD FAILED: ' + (e.stack || e)); process.exit(1); });
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ILDC session banner</title>
+<style>
+  /* Landscape version of the session poster, used as the header of the session page on the website. 1600 × 900. */
+  @font-face { font-family: Lato; font-weight: 400; src: url(/node_modules/@fontsource/lato/files/lato-latin-400-normal.woff2) format('woff2'); }
+  @font-face { font-family: Lato; font-weight: 700; src: url(/node_modules/@fontsource/lato/files/lato-latin-700-normal.woff2) format('woff2'); }
+  @font-face { font-family: Title; font-weight: 800; src: url(/node_modules/@fontsource/barlow/files/barlow-latin-800-normal.woff2) format('woff2'); }
+
+  :root { --cal: #f17c9b; --pin: #909dda; }
+  body[data-colourway="purple"]  { --bg: #47438f; --fg: #ffffff; --title: #fff4e0; --conf: #ffffff; }
+  body[data-colourway="mustard"] { --bg: #b8aa48; --fg: #000000; --title: #000000; --conf: #ffffff; }
+  body[data-colourway="green"]   { --bg: #86bfa7; --fg: #000000; --title: #000000; --conf: #000000; }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1600px; height: 900px; }
+  body { font-family: Lato, sans-serif; color: var(--fg); background: var(--bg); position: relative; overflow: hidden; }
+  .abs { position: absolute; }
+
+  /* Artwork: the poster background is cut into its top-right illustration and its bottom landscape. */
+  #corner { right: 0; top: 0; width: 560px; height: 630px; background-repeat: no-repeat; background-size: 1512px 1890px; background-position: -952px 0; }
+  #strip { left: 0; top: 540px; width: 1600px; height: 360px; background-repeat: no-repeat; background-size: 1600px 2000px; background-position: 0 -1407px; }
+
+  #conf-logo { left: 80px; top: 60px; width: 104px; height: 104px; border-radius: 50%; background: #fff; display: grid; place-items: center; overflow: hidden; }
+  #conf-logo img { width: 88%; height: 88%; object-fit: contain; }
+  #conf-divider { left: 208px; top: 70px; width: 2px; height: 84px; background: var(--conf); opacity: .8; }
+  #conf-name { left: 228px; top: 68px; font: 700 22px/1.2 Lato; letter-spacing: .13em; text-transform: uppercase; color: var(--conf); }
+
+  #kicker { left: 82px; top: 212px; font: 700 21px/1 Lato; letter-spacing: .4em; text-transform: uppercase; }
+  #title { left: 80px; top: 250px; width: 960px; height: 190px; display: flex; align-items: flex-start;
+           font-family: Title; font-weight: 800; color: var(--title); line-height: .95; letter-spacing: -.01em; }
+
+  .meta { top: 462px; display: flex; align-items: center; gap: 18px; }
+  .meta .ico { width: 84px; height: 84px; border-radius: 50%; display: grid; place-items: center; flex: none; }
+  .meta .ico svg { width: 40px; height: 40px; }
+  .meta b { display: block; font: 700 25px/1.25 Lato; }
+  .meta span { font: 400 22px/1.25 Lato; }
+  #when { left: 80px; } #when .ico { background: var(--cal); }
+  #where-line { top: 462px; width: 2px; height: 84px; background: var(--fg); opacity: .55; }
+  #where .ico { background: var(--pin); }
+
+  /* Organiser logos: white strip along the bottom, as on the portrait poster. */
+  #footer { left: 0; top: 774px; width: 1600px; height: 126px; background: #fff; display: flex; align-items: center; padding: 0 80px; gap: 48px; }
+  #footer .label { font: 700 21px/1 Lato; letter-spacing: .15em; text-transform: uppercase; color: #2e2d58; white-space: nowrap; flex: none; }
+  #logos { flex: 1; display: flex; align-items: center; justify-content: space-evenly; height: 100%; }
+  #logos img { display: block; }
+</style>
+</head>
+<body>
+<div id="corner" class="abs"></div>
+<div id="strip" class="abs"></div>
+<div id="conf-logo" class="abs"></div>
+<div id="conf-divider" class="abs"></div>
+<div id="conf-name" class="abs">India Land &amp; Development<br>Conference<br>2026</div>
+<div id="kicker" class="abs"></div>
+<div id="title" class="abs"><span></span></div>
+<div id="when" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="#1f1d3d" stroke-width="2.2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></div>
+  <div><b id="date"></b><span id="time"></span></div>
+</div>
+<div id="where-line" class="abs"></div>
+<div id="where" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="#1f1d3d"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg></div>
+  <div><b id="room"></b><span id="venue"></span></div>
+</div>
+<div id="footer" class="abs"><div class="label">Session organised by</div><div id="logos"></div></div>
+<script>
+function fit(el, box, max, min) {
+  let s = max; el.style.fontSize = s + 'px';
+  while ((box.scrollHeight > box.clientHeight + 1 || box.scrollWidth > box.clientWidth + 1) && s > min) { s -= 1; el.style.fontSize = s + 'px'; }
+}
+async function render(d) {
+  document.body.dataset.colourway = d.colourway || 'purple';
+  for (const id of ['corner', 'strip']) document.getElementById(id).style.backgroundImage = `url(${d.art})`;
+  if (d.confLogo) document.getElementById('conf-logo').innerHTML = `<img src="${d.confLogo}">`;
+  document.getElementById('kicker').textContent = d.kicker;
+  const t = document.querySelector('#title span'); t.textContent = d.title;
+  document.getElementById('date').textContent = d.date;
+  document.getElementById('time').textContent = d.time;
+  document.getElementById('room').textContent = d.room;
+  document.getElementById('venue').textContent = d.venue;
+  // Organiser logos: equal visual area, capped size. No logos means no white strip.
+  const L = (d.logos || []).length, footer = document.getElementById('footer');
+  if (!L) footer.style.display = 'none';
+  else {
+    const esc = x => String(x || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const avail = 1600 - 160 - 48 - 330, gap = 40, maxH = L <= 2 ? 86 : 74, maxW = L <= 2 ? 420 : 260;
+    const dims = a => d.logos.map(l => { let h = Math.min(maxH, Math.sqrt(a / l.aspect)), w = h * l.aspect; if (w > maxW) { w = maxW; h = w / l.aspect; } return { w, h }; });
+    let a = maxH * maxH * 2.2, ds = dims(a);
+    while (ds.reduce((t, x) => t + x.w, 0) + gap * (L - 1) > avail && a > 400) { a *= .92; ds = dims(a); }
+    document.getElementById('logos').innerHTML = d.logos.map((l, i) => `<img src="${l.src}" alt="${esc(l.name)}" style="width:${ds[i].w.toFixed(1)}px;height:${ds[i].h.toFixed(1)}px">`).join('');
+  }
+  await document.fonts.ready;
+  await Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })));
+  await new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = d.art; });
+  fit(t, document.getElementById('title'), 68, 40);
+  // place the room block after the date block
+  const when = document.getElementById('when').getBoundingClientRect();
+  const x = Math.max(560, when.right + 48);
+  document.getElementById('where-line').style.left = x + 'px';
+  document.getElementById('where').style.left = (x + 30) + 'px';
+  return [];
+}
+</script>
+</body>
+</html>
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ILDC session banner (mobile)</title>
+<style>
+  /* Phone version of the session banner: 1080 × 1300, bigger text, logos given the full width. */
+  @font-face { font-family: Lato; font-weight: 400; src: url(/node_modules/@fontsource/lato/files/lato-latin-400-normal.woff2) format('woff2'); }
+  @font-face { font-family: Lato; font-weight: 700; src: url(/node_modules/@fontsource/lato/files/lato-latin-700-normal.woff2) format('woff2'); }
+  @font-face { font-family: Title; font-weight: 800; src: url(/node_modules/@fontsource/barlow/files/barlow-latin-800-normal.woff2) format('woff2'); }
+
+  :root { --cal: #f17c9b; --pin: #909dda; }
+  body[data-colourway="purple"]  { --bg: #47438f; --fg: #ffffff; --title: #fff4e0; --conf: #ffffff; }
+  body[data-colourway="mustard"] { --bg: #b8aa48; --fg: #000000; --title: #000000; --conf: #ffffff; }
+  body[data-colourway="green"]   { --bg: #86bfa7; --fg: #000000; --title: #000000; --conf: #000000; }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1080px; height: 1300px; }
+  body { font-family: Lato, sans-serif; color: var(--fg); background: var(--bg); position: relative; overflow: hidden; }
+  .abs { position: absolute; }
+
+  /* Artwork at its poster size: top half as is, bottom half moved up 50 px (cut from the plain middle). */
+  #top { left: 0; top: 0; width: 1080px; height: 600px; background-repeat: no-repeat; background-size: 1080px 1350px; background-position: 0 0; }
+  #bottom { left: 0; top: 600px; width: 1080px; height: 700px; background-repeat: no-repeat; background-size: 1080px 1350px; background-position: 0 -650px; }
+
+  #conf-logo { left: 60px; top: 60px; width: 124px; height: 124px; border-radius: 50%; background: #fff; display: grid; place-items: center; overflow: hidden; }
+  #conf-logo img { width: 88%; height: 88%; object-fit: contain; }
+  #conf-divider { left: 208px; top: 72px; width: 2px; height: 100px; background: var(--conf); opacity: .8; }
+  #conf-name { left: 230px; top: 74px; font: 700 27px/1.2 Lato; letter-spacing: .13em; text-transform: uppercase; color: var(--conf); }
+
+  #kicker { left: 62px; top: 252px; font: 700 27px/1 Lato; letter-spacing: .3em; text-transform: uppercase; }
+  #title { left: 60px; top: 300px; width: 700px; height: 300px; display: flex; align-items: flex-start;
+           font-family: Title; font-weight: 800; color: var(--title); line-height: .95; letter-spacing: -.01em; }
+
+  .meta { left: 60px; width: 960px; display: flex; align-items: center; gap: 24px; }
+  .meta .ico { width: 100px; height: 100px; border-radius: 50%; display: grid; place-items: center; flex: none; }
+  .meta .ico svg { width: 48px; height: 48px; }
+  .meta b { display: block; font: 700 40px/1.2 Lato; }
+  .meta span { font: 400 34px/1.25 Lato; }
+  #when { top: 640px; } #when .ico { background: var(--cal); }
+  #where { top: 768px; } #where .ico { background: var(--pin); }
+
+  /* Organiser logos: white strip across the bottom, label above the logos. */
+  #footer { left: 0; top: 1100px; width: 1080px; height: 200px; background: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 0 60px; }
+  #footer .label { font: 700 26px/1 Lato; letter-spacing: .18em; text-transform: uppercase; color: #2e2d58; white-space: nowrap; }
+  #logos { width: 100%; display: flex; align-items: center; justify-content: space-evenly; height: 120px; }
+  #logos img { display: block; }
+</style>
+</head>
+<body>
+<div id="top" class="abs"></div>
+<div id="bottom" class="abs"></div>
+<div id="conf-logo" class="abs"></div>
+<div id="conf-divider" class="abs"></div>
+<div id="conf-name" class="abs">India Land &amp; Development<br>Conference<br>2026</div>
+<div id="kicker" class="abs"></div>
+<div id="title" class="abs"><span></span></div>
+<div id="when" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="#1f1d3d" stroke-width="2.2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></div>
+  <div><b id="date"></b><span id="time"></span></div>
+</div>
+<div id="where" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="#1f1d3d"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg></div>
+  <div><b id="room"></b><span id="venue"></span></div>
+</div>
+<div id="footer" class="abs"><div class="label">Session organised by</div><div id="logos"></div></div>
+<script>
+function fit(el, box, max, min) {
+  let s = max; el.style.fontSize = s + 'px';
+  while ((box.scrollHeight > box.clientHeight + 1 || box.scrollWidth > box.clientWidth + 1) && s > min) { s -= 1; el.style.fontSize = s + 'px'; }
+}
+async function render(d) {
+  document.body.dataset.colourway = d.colourway || 'purple';
+  for (const id of ['top', 'bottom']) document.getElementById(id).style.backgroundImage = `url(${d.art})`;
+  if (d.confLogo) document.getElementById('conf-logo').innerHTML = `<img src="${d.confLogo}">`;
+  document.getElementById('kicker').textContent = d.kicker;
+  const t = document.querySelector('#title span'); t.textContent = d.title;
+  document.getElementById('date').textContent = d.date;
+  document.getElementById('time').textContent = d.time;
+  document.getElementById('room').textContent = d.room;
+  document.getElementById('venue').textContent = d.venue;
+  // Organiser logos: equal visual area, capped size. No logos means no white strip.
+  const L = (d.logos || []).length, footer = document.getElementById('footer');
+  if (!L) footer.style.display = 'none';
+  else {
+    const esc = x => String(x || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const avail = 960, gap = 40, maxH = L <= 2 ? 116 : L <= 4 ? 96 : 80, maxW = L <= 2 ? 420 : 300;
+    const dims = a => d.logos.map(l => { let h = Math.min(maxH, Math.sqrt(a / l.aspect)), w = h * l.aspect; if (w > maxW) { w = maxW; h = w / l.aspect; } return { w, h }; });
+    let a = maxH * maxH * 2.2, ds = dims(a);
+    while (ds.reduce((t, x) => t + x.w, 0) + gap * (L - 1) > avail && a > 400) { a *= .92; ds = dims(a); }
+    document.getElementById('logos').innerHTML = d.logos.map((l, i) => `<img src="${l.src}" alt="${esc(l.name)}" style="width:${ds[i].w.toFixed(1)}px;height:${ds[i].h.toFixed(1)}px">`).join('');
+  }
+  await document.fonts.ready;
+  await Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })));
+  await new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = d.art; });
+  fit(t, document.getElementById('title'), 92, 52);
+  return [];
+}
+</script>
+</body>
+</html>
+
+// The "engine": one headless browser that crops photos, trims logos and renders posters.
+import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { removeBackground } from '@imgly/background-removal-node';
+import { serve } from './server.mjs';
+const { chromium } = createRequire(import.meta.url)('playwright');
+
+const dataUrl = (buf, mime) => `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
+const fromDataUrl = s => Buffer.from(s.split(',')[1], 'base64');
+
+export function mimeOf(filename = '', fallback = '') {
+  const ext = path.extname(filename).toLowerCase();
+  return { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif',
+    '.pdf': 'application/pdf', '.svg': 'image/svg+xml', '.heic': 'image/heic', '.heif': 'image/heif' }[ext] || fallback || 'application/octet-stream';
+}
+
+// PDFs become a PNG of their first page. Returns { buf, mime } or throws a readable error.
+export function toImage(buf, filename, mime) {
+  mime = mime || mimeOf(filename);
+  if (mime === 'application/pdf') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
+    fs.writeFileSync(path.join(dir, 'in.pdf'), buf);
+    execFileSync('pdftoppm', ['-png', '-r', '200', '-f', '1', '-l', '1', '-singlefile', path.join(dir, 'in.pdf'), path.join(dir, 'out')]);
+    return { buf: fs.readFileSync(path.join(dir, 'out.png')), mime: 'image/png', note: 'converted from PDF' };
+  }
+  if (/heic|heif/.test(mime)) throw new Error('photo is HEIC (iPhone format) – please upload a JPG');
+  if (!/^image\/(jpeg|png|webp|gif|svg\+xml)$/.test(mime)) throw new Error(`not an image file (${mime}) – please upload a PNG or JPG`);
+  return { buf, mime };
+}
+
+export async function startEngine(root) {
+  const srv = await serve(root);
+  const browser = await chromium.launch();
+  const tools = await browser.newPage();
+  await tools.goto(srv.url + '/browser.html');
+  const poster = await (await browser.newContext({ viewport: { width: 1080, height: 1350 }, deviceScaleFactor: 2 })).newPage();
+
+  return {
+    url: srv.url,
+
+    // Raw photo bytes → { png (standard cut-out headshot), flags[] }
+    async headshot(buf, filename, mime) {
+      const img = toImage(buf, filename, mime);
+      const cut = await removeBackground(new Blob([img.buf], { type: img.mime }), { model: 'medium', output: { format: 'image/png' } });
+      const cutBuf = Buffer.from(await cut.arrayBuffer());
+      const r = await tools.evaluate(([a, b]) => standardise(a, b), [dataUrl(img.buf, img.mime), dataUrl(cutBuf, 'image/png')]);
+      if (img.note) r.flags.unshift(img.note);
+      return r.ok ? { png: fromDataUrl(r.cutout), flags: r.flags } : { png: null, flags: r.flags };
+    },
+
+    async logo(buf, filename, mime) {
+      const img = toImage(buf, filename, mime);
+      const r = await tools.evaluate(s => trimLogo(s), dataUrl(img.buf, img.mime));
+      return { png: fromDataUrl(r.png), aspect: r.aspect };
+    },
+
+    // Render one poster. `data` uses URLs relative to the engine's server root. Returns { png, warnings }.
+    async render(data) {
+      await poster.goto(srv.url + '/poster.html');
+      const warnings = await poster.evaluate(d => render(d), data);
+      return { png: await poster.screenshot({ type: 'png' }), warnings };
+    },
+
+    // Landscape banner (1600×900) for the top of the session page on the website.
+    async banner(data) {
+      if (!this._banner) this._banner = await (await browser.newContext({ viewport: { width: 1600, height: 900 }, deviceScaleFactor: 1 })).newPage();
+      await this._banner.goto(srv.url + '/banner.html');
+      await this._banner.evaluate(d => render(d), data);
+      return await this._banner.screenshot({ type: 'png' });
+    },
+
+    // Phone version of the banner (1080×1300): bigger text, logos across the full width.
+    async bannerMobile(data) {
+      if (!this._bannerM) this._bannerM = await (await browser.newContext({ viewport: { width: 1080, height: 1300 }, deviceScaleFactor: 1 })).newPage();
+      await this._bannerM.goto(srv.url + '/banner_mobile.html');
+      await this._bannerM.evaluate(d => render(d), data);
+      return await this._bannerM.screenshot({ type: 'png' });
+    },
+
+    // Organiser logos on a transparent background (1400×200).
+    async logoRow(logos) {
+      if (!this._logos) this._logos = await (await browser.newContext({ viewport: { width: 1400, height: 200 }, deviceScaleFactor: 1 })).newPage();
+      await this._logos.goto(srv.url + '/logos.html');
+      await this._logos.evaluate(d => render(d), { logos });
+      return await this._logos.screenshot({ type: 'png', omitBackground: true });
+    },
+
+    // Programme PDF: two posters side by side per A4 landscape page.
+    async programme(pngPaths, outPath) {
+      const pages = [];
+      for (let i = 0; i < pngPaths.length; i += 2) pages.push(pngPaths.slice(i, i + 2));
+      const p = await browser.newPage();
+      await p.setContent(`<!doctype html><base href="${srv.url}/"><style>
+        @page { size: A4 landscape; margin: 0 } body { margin: 0 }
+        .pg { width: 297mm; height: 210mm; display: flex; justify-content: center; align-items: center; gap: 8mm; page-break-after: always; }
+        .pg img { height: 188mm; width: 150.4mm; display: block; }</style>${pages.map(pg => `<div class="pg">${pg.map(f => `<img src="/${f}">`).join('')}</div>`).join('')}`);
+      await p.waitForLoadState('networkidle');
+      await p.pdf({ path: outPath, format: 'A4', landscape: true, printBackground: true });
+      await p.close();
+    },
+
+    async close() { await browser.close(); srv.close(); },
+  };
+}
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Organiser logos</title>
+<style>
+  /* A clean, transparent row of a session's organiser logos for the website (1400 × 200). */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1400px; height: 200px; background: transparent; }
+  #logos { width: 1400px; height: 200px; display: flex; align-items: center; justify-content: center; gap: 72px; padding: 0 20px; }
+  #logos img { display: block; }
+</style>
+</head>
+<body>
+<div id="logos"></div>
+<script>
+async function render(d) {
+  // Equal visual weight: every logo gets about the same area, capped in height and width.
+  const L = d.logos.length, avail = 1360, gap = 72, maxH = 150, maxW = L <= 2 ? 520 : 380;
+  let area = maxH * maxH * 1.7;
+  const dims = a => d.logos.map(l => { let h = Math.min(maxH, Math.sqrt(a / l.aspect)), w = h * l.aspect; if (w > maxW) { w = maxW; h = w / l.aspect; } return { w, h }; });
+  let ds = dims(area);
+  while (ds.reduce((s, x) => s + x.w, 0) + gap * (L - 1) > avail && area > 400) { area *= .92; ds = dims(area); }
+  document.getElementById('logos').innerHTML = d.logos.map((l, i) => `<img src="${l.src}" alt="" style="width:${ds[i].w.toFixed(1)}px;height:${ds[i].h.toFixed(1)}px">`).join('');
+  await Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })));
+  return [];
+}
+</script>
+</body>
+</html>
+
+{
+  "name": "ildc-posters",
+  "version": "1.0.0",
+  "description": "ILDC session poster builder: Airtable to posters to Wix",
+  "scripts": {
+    "build": "node sync.mjs",
+    "redraw-all": "node sync.mjs --all"
+  },
+  "dependencies": {
+    "@fontsource/barlow": "^5.3.0",
+    "@fontsource/lato": "^5.3.0",
+    "@imgly/background-removal-node": "^1.4.5",
+    "@vladmandic/face-api": "^1.7.15",
+    "docx": "^9.5.1",
+    "playwright": "1.63.0"
+  },
+  "private": true
+}
+
+{
+  "name": "ildc-posters",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "ildc-posters",
+      "version": "1.0.0",
+      "dependencies": {
+        "@fontsource/barlow": "^5.3.0",
+        "@fontsource/lato": "^5.3.0",
+        "@imgly/background-removal-node": "^1.4.5",
+        "@vladmandic/face-api": "^1.7.15",
+        "docx": "^9.5.1",
+        "playwright": "1.63.0"
+      }
+    },
+    "node_modules/@fontsource/barlow": {
+      "version": "5.3.0",
+      "resolved": "https://registry.npmjs.org/@fontsource/barlow/-/barlow-5.3.0.tgz",
+      "integrity": "sha512-tGR0y6QObRtKv71MOth44222+mdNFM/ZWFWDV1VLzNbG4oK9PNRlyJzmkck4vHAi9ibHBXgt4SlY51amFP55CA==",
+      "license": "OFL-1.1",
+      "funding": {
+        "url": "https://github.com/sponsors/ayuhito"
+      }
+    },
+    "node_modules/@fontsource/lato": {
+      "version": "5.3.0",
+      "resolved": "https://registry.npmjs.org/@fontsource/lato/-/lato-5.3.0.tgz",
+      "integrity": "sha512-0WhF/4rhrw+ErIyneKvhHn2YAl+xf8GDtllgOgOzDmeaSlLQtjpChXaQOpWhG2BchQW0WJy2zLV12Hdg0ndOMw==",
+      "license": "OFL-1.1",
+      "funding": {
+        "url": "https://github.com/sponsors/ayuhito"
+      }
+    },
+    "node_modules/@imgly/background-removal-node": {
+      "version": "1.4.5",
+      "resolved": "https://registry.npmjs.org/@imgly/background-removal-node/-/background-removal-node-1.4.5.tgz",
+      "integrity": "sha512-/s9K88qhKy1jPhrSkBxurUqCVqJ8KHWCc+5yWdppdC4fuSrGC8mK8WQtmULs2ASEr8naY1qpvZu0EL5jr2Hqtg==",
+      "license": "SEE LICENSE IN LICENSE.md",
+      "dependencies": {
+        "@types/lodash": "~4.14.195",
+        "@types/ndarray": "~1.0.14",
+        "@types/node": "~20.3.1",
+        "lodash": "~4.17.21",
+        "ndarray": "~1.0.19",
+        "onnxruntime-node": "~1.17.0",
+        "sharp": "~0.32.4",
+        "zod": "~3.21.4"
+      }
+    },
+    "node_modules/@isaacs/fs-minipass": {
+      "version": "4.0.1",
+      "resolved": "https://registry.npmjs.org/@isaacs/fs-minipass/-/fs-minipass-4.0.1.tgz",
+      "integrity": "sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==",
+      "license": "ISC",
+      "dependencies": {
+        "minipass": "^7.0.4"
+      },
+      "engines": {
+        "node": ">=18.0.0"
+      }
+    },
+    "node_modules/@types/lodash": {
+      "version": "4.14.202",
+      "resolved": "https://registry.npmjs.org/@types/lodash/-/lodash-4.14.202.tgz",
+      "integrity": "sha512-OvlIYQK9tNneDlS0VN54LLd5uiPCBOp7gS5Z0f1mjoJYBrtStzgmJBxONW3U6OZqdtNzZPmn9BS/7WI7BFFcFQ==",
+      "license": "MIT"
+    },
+    "node_modules/@types/ndarray": {
+      "version": "1.0.14",
+      "resolved": "https://registry.npmjs.org/@types/ndarray/-/ndarray-1.0.14.tgz",
+      "integrity": "sha512-oANmFZMnFQvb219SSBIhI1Ih/r4CvHDOzkWyJS/XRqkMrGH5/kaPSA1hQhdIBzouaE+5KpE/f5ylI9cujmckQg==",
+      "license": "MIT"
+    },
+    "node_modules/@types/node": {
+      "version": "20.3.3",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-20.3.3.tgz",
+      "integrity": "sha512-wheIYdr4NYML61AjC8MKj/2jrR/kDQri/CIpVoZwldwhnIrD/j9jIU5bJ8yBKuB2VhpFV7Ab6G2XkBjv9r9Zzw==",
+      "license": "MIT"
+    },
+    "node_modules/@vladmandic/face-api": {
+      "version": "1.7.15",
+      "resolved": "https://registry.npmjs.org/@vladmandic/face-api/-/face-api-1.7.15.tgz",
+      "integrity": "sha512-WDMmK3CfNLo8jylWqMoQgf4nIst3M0fzx1dnac96wv/dvMTN4DxC/Pq1DGtduDk1lktCamQ3MIDXFnvrdHTXDw==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=14.0.0"
+      }
+    },
+    "node_modules/b4a": {
+      "version": "1.9.0",
+      "resolved": "https://registry.npmjs.org/b4a/-/b4a-1.9.0.tgz",
+      "integrity": "sha512-dpfcF9fDNR6++cthXR67iyhgqWy9CBouAvIWhIntzBG6cvK/cnIPiZQjBwi/ZqjjBEDGfoNDtmB0kTjroOJ3pQ==",
+      "license": "Apache-2.0",
+      "peerDependencies": {
+        "react-native-b4a": "*"
+      },
+      "peerDependenciesMeta": {
+        "react-native-b4a": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/bare-events": {
+      "version": "2.9.2",
+      "resolved": "https://registry.npmjs.org/bare-events/-/bare-events-2.9.2.tgz",
+      "integrity": "sha512-AIPKioV7/Y/8KfZ3AAhjPJxLLbY49S64Ym5DakZlUg75qQiTgUq9hEJoEwa4eUezPUlXRy/i5NpsKvo9jgKmoA==",
+      "license": "Apache-2.0",
+      "peerDependencies": {
+        "bare-abort-controller": "*"
+      },
+      "peerDependenciesMeta": {
+        "bare-abort-controller": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/bare-fs": {
+      "version": "4.8.4",
+      "resolved": "https://registry.npmjs.org/bare-fs/-/bare-fs-4.8.4.tgz",
+      "integrity": "sha512-MPC2eyrpbk3A873sK4y6rk+Iv4o2enxTjHZ8zH3HO0mjrpm5XjnguY2XmfidIsDV6vnjpbMBKUAJpV0ISD2SsQ==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "bare-events": "^2.5.4",
+        "bare-path": "^3.0.0",
+        "bare-stream": "^2.6.4",
+        "bare-url": "^2.2.2",
+        "fast-fifo": "^1.3.2"
+      },
+      "engines": {
+        "bare": ">=1.28.0"
+      },
+      "peerDependencies": {
+        "bare-buffer": "*"
+      },
+      "peerDependenciesMeta": {
+        "bare-buffer": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/bare-path": {
+      "version": "3.1.2",
+      "resolved": "https://registry.npmjs.org/bare-path/-/bare-path-3.1.2.tgz",
+      "integrity": "sha512-ZyKbsuuqK6Ag0K8pX6V5Txq6XeJRvY+wXucnFGRjiyVYP9YWDpIQugk/b+enRYrEYBJaqLzghRQpXPMR7341Nw==",
+      "license": "Apache-2.0"
+    },
+    "node_modules/bare-stream": {
+      "version": "2.13.4",
+      "resolved": "https://registry.npmjs.org/bare-stream/-/bare-stream-2.13.4.tgz",
+      "integrity": "sha512-PcrQ8lVLbiJscNm1Kez+Yp4Gy4AHGcN1lzwjvf5NybWen7VvEgUfyfnXYJ2zNqWnzOfCb1Abq6lH8ti0syQszA==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "b4a": "^1.8.1",
+        "streamx": "^2.25.0",
+        "teex": "^1.0.1"
+      },
+      "peerDependencies": {
+        "bare-abort-controller": "*",
+        "bare-buffer": "*",
+        "bare-events": "*"
+      },
+      "peerDependenciesMeta": {
+        "bare-abort-controller": {
+          "optional": true
+        },
+        "bare-buffer": {
+          "optional": true
+        },
+        "bare-events": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/bare-url": {
+      "version": "2.5.5",
+      "resolved": "https://registry.npmjs.org/bare-url/-/bare-url-2.5.5.tgz",
+      "integrity": "sha512-iM9qJCruvpt2rPaLsrumVDru9pogI7PHziHIa9kTNRFt8C8HuSa+kI9kFezK+NvHEFnnz71rKGZ1EAilq/3V/Q==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "bare-path": "^3.0.0"
+      }
+    },
+    "node_modules/base64-js": {
+      "version": "1.5.1",
+      "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
+      "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT"
+    },
+    "node_modules/bl": {
+      "version": "4.1.0",
+      "resolved": "https://registry.npmjs.org/bl/-/bl-4.1.0.tgz",
+      "integrity": "sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==",
+      "license": "MIT",
+      "dependencies": {
+        "buffer": "^5.5.0",
+        "inherits": "^2.0.4",
+        "readable-stream": "^3.4.0"
+      }
+    },
+    "node_modules/buffer": {
+      "version": "5.7.1",
+      "resolved": "https://registry.npmjs.org/buffer/-/buffer-5.7.1.tgz",
+      "integrity": "sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "base64-js": "^1.3.1",
+        "ieee754": "^1.1.13"
+      }
+    },
+    "node_modules/chownr": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/chownr/-/chownr-3.0.0.tgz",
+      "integrity": "sha512-+IxzY9BZOQd/XuYPRmrvEVjF/nqj5kgT4kEq7VofrDoM1MxoRjEWkrCC3EtLi59TVawxTAn+orJwFQcrqEN1+g==",
+      "license": "BlueOak-1.0.0",
+      "engines": {
+        "node": ">=18"
+      }
+    },
+    "node_modules/color": {
+      "version": "4.2.3",
+      "resolved": "https://registry.npmjs.org/color/-/color-4.2.3.tgz",
+      "integrity": "sha512-1rXeuUUiGGrykh+CeBdu5Ie7OJwinCgQY0bc7GCRxy5xVHy+moaqkpL/jqQq0MtQOeYcrqEz4abc5f0KtU7W4A==",
+      "license": "MIT",
+      "dependencies": {
+        "color-convert": "^2.0.1",
+        "color-string": "^1.9.0"
+      },
+      "engines": {
+        "node": ">=12.5.0"
+      }
+    },
+    "node_modules/color-convert": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-2.0.1.tgz",
+      "integrity": "sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==",
+      "license": "MIT",
+      "dependencies": {
+        "color-name": "~1.1.4"
+      },
+      "engines": {
+        "node": ">=7.0.0"
+      }
+    },
+    "node_modules/color-name": {
+      "version": "1.1.4",
+      "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.4.tgz",
+      "integrity": "sha512-dOy+3AuW3a2wNbZHIuMZpTcgjGuLU/uBL/ubcZF9OXbDo8ff4O8yVp5Bf0efS8uEoYo5q4Fx7dY9OgQGXgAsQA==",
+      "license": "MIT"
+    },
+    "node_modules/color-string": {
+      "version": "1.9.1",
+      "resolved": "https://registry.npmjs.org/color-string/-/color-string-1.9.1.tgz",
+      "integrity": "sha512-shrVawQFojnZv6xM40anx4CkoDP+fZsw/ZerEMsW/pyzsRbElpsL/DBVW7q3ExxwusdNXI3lXpuhEZkzs8p5Eg==",
+      "license": "MIT",
+      "dependencies": {
+        "color-name": "^1.0.0",
+        "simple-swizzle": "^0.2.2"
+      }
+    },
+    "node_modules/core-util-is": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/core-util-is/-/core-util-is-1.0.3.tgz",
+      "integrity": "sha512-ZQBvi1DcpJ4GDqanjucZ2Hj3wEO5pZDS89BWbkcrvdxksJorwUDDZamX9ldFkp9aw2lmBDLgkObEA4DWNJ9FYQ==",
+      "license": "MIT"
+    },
+    "node_modules/decompress-response": {
+      "version": "6.0.0",
+      "resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-6.0.0.tgz",
+      "integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
+      "license": "MIT",
+      "dependencies": {
+        "mimic-response": "^3.1.0"
+      },
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
+    "node_modules/deep-extend": {
+      "version": "0.6.0",
+      "resolved": "https://registry.npmjs.org/deep-extend/-/deep-extend-0.6.0.tgz",
+      "integrity": "sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=4.0.0"
+      }
+    },
+    "node_modules/detect-libc": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+      "license": "Apache-2.0",
+      "engines": {
+        "node": ">=8"
+      }
+    },
+    "node_modules/docx": {
+      "version": "9.5.1",
+      "resolved": "https://registry.npmjs.org/docx/-/docx-9.5.1.tgz",
+      "integrity": "sha512-ABDI7JEirFD2+bHhOBlsGZxaG1UgZb2M/QMKhLSDGgVNhxDesTCDcP+qoDnDGjZ4EOXTRfUjUgwHVuZ6VSTfWQ==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "^24.0.1",
+        "hash.js": "^1.1.7",
+        "jszip": "^3.10.1",
+        "nanoid": "^5.1.3",
+        "xml": "^1.0.1",
+        "xml-js": "^1.6.8"
+      },
+      "engines": {
+        "node": ">=10"
+      }
+    },
+    "node_modules/docx/node_modules/@types/node": {
+      "version": "24.19.2",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-24.19.2.tgz",
+      "integrity": "sha512-93d49wCWJkCyN87MxLpNN6KXPCwFw7bVUg79mGUV1OS40JGWwVCr8n61DXCSqz7CV6/VfPkb7xec7uP2M+QHWQ==",
+      "license": "MIT",
+      "dependencies": {
+        "undici-types": ">=7.24.0 <7.24.7"
+      }
+    },
+    "node_modules/end-of-stream": {
+      "version": "1.4.5",
+      "resolved": "https://registry.npmjs.org/end-of-stream/-/end-of-stream-1.4.5.tgz",
+      "integrity": "sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==",
+      "license": "MIT",
+      "dependencies": {
+        "once": "^1.4.0"
+      }
+    },
+    "node_modules/events-universal": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/events-universal/-/events-universal-1.0.1.tgz",
+      "integrity": "sha512-LUd5euvbMLpwOF8m6ivPCbhQeSiYVNb8Vs0fQ8QjXo0JTkEHpz8pxdQf0gStltaPpw0Cca8b39KxvK9cfKRiAw==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "bare-events": "^2.7.0"
+      }
+    },
+    "node_modules/expand-template": {
+      "version": "2.0.3",
+      "resolved": "https://registry.npmjs.org/expand-template/-/expand-template-2.0.3.tgz",
+      "integrity": "sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==",
+      "license": "(MIT OR WTFPL)",
+      "engines": {
+        "node": ">=6"
+      }
+    },
+    "node_modules/fast-fifo": {
+      "version": "1.3.2",
+      "resolved": "https://registry.npmjs.org/fast-fifo/-/fast-fifo-1.3.2.tgz",
+      "integrity": "sha512-/d9sfos4yxzpwkDkuN7k2SqFKtYNmCTzgfEpz82x34IM9/zc8KGxQoXg1liNC/izpRM/MBdt44Nmx41ZWqk+FQ==",
+      "license": "MIT"
+    },
+    "node_modules/fs-constants": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/fs-constants/-/fs-constants-1.0.0.tgz",
+      "integrity": "sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow==",
+      "license": "MIT"
+    },
+    "node_modules/github-from-package": {
+      "version": "0.0.0",
+      "resolved": "https://registry.npmjs.org/github-from-package/-/github-from-package-0.0.0.tgz",
+      "integrity": "sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==",
+      "license": "MIT"
+    },
+    "node_modules/hash.js": {
+      "version": "1.1.7",
+      "resolved": "https://registry.npmjs.org/hash.js/-/hash.js-1.1.7.tgz",
+      "integrity": "sha512-taOaskGt4z4SOANNseOviYDvjEJinIkRgmp7LbKP2YTTmVxWBl87s/uzK9r+44BclBSp2X7K1hqeNfz9JbBeXA==",
+      "license": "MIT",
+      "dependencies": {
+        "inherits": "^2.0.3",
+        "minimalistic-assert": "^1.0.1"
+      }
+    },
+    "node_modules/ieee754": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
+      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "BSD-3-Clause"
+    },
+    "node_modules/immediate": {
+      "version": "3.0.6",
+      "resolved": "https://registry.npmjs.org/immediate/-/immediate-3.0.6.tgz",
+      "integrity": "sha512-XXOFtyqDjNDAQxVfYxuF7g9Il/IbWmmlQg2MYKOH8ExIT1qg6xc4zyS3HaEEATgs1btfzxq15ciUiY7gjSXRGQ==",
+      "license": "MIT"
+    },
+    "node_modules/inherits": {
+      "version": "2.0.4",
+      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
+      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
+      "license": "ISC"
+    },
+    "node_modules/ini": {
+      "version": "1.3.8",
+      "resolved": "https://registry.npmjs.org/ini/-/ini-1.3.8.tgz",
+      "integrity": "sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==",
+      "license": "ISC"
+    },
+    "node_modules/iota-array": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/iota-array/-/iota-array-1.0.0.tgz",
+      "integrity": "sha512-pZ2xT+LOHckCatGQ3DcG/a+QuEqvoxqkiL7tvE8nn3uuu+f6i1TtpB5/FtWFbxUuVr5PZCx8KskuGatbJDXOWA==",
+      "license": "MIT"
+    },
+    "node_modules/is-arrayish": {
+      "version": "0.3.4",
+      "resolved": "https://registry.npmjs.org/is-arrayish/-/is-arrayish-0.3.4.tgz",
+      "integrity": "sha512-m6UrgzFVUYawGBh1dUsWR5M2Clqic9RVXC/9f8ceNlv2IcO9j9J/z8UoCLPqtsPBFNzEpfR3xftohbfqDx8EQA==",
+      "license": "MIT"
+    },
+    "node_modules/is-buffer": {
+      "version": "1.1.6",
+      "resolved": "https://registry.npmjs.org/is-buffer/-/is-buffer-1.1.6.tgz",
+      "integrity": "sha512-NcdALwpXkTm5Zvvbk7owOUSvVvBKDgKP5/ewfXEznmQFfs4ZRmanOeKBTjRVjka3QFoN6XJ+9F3USqfHqTaU5w==",
+      "license": "MIT"
+    },
+    "node_modules/isarray": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/isarray/-/isarray-1.0.0.tgz",
+      "integrity": "sha512-VLghIWNM6ELQzo7zwmcg0NmTVyWKYjvIeM83yjp0wRDTmUnrM678fQbcKBo6n2CJEF0szoG//ytg+TKla89ALQ==",
+      "license": "MIT"
+    },
+    "node_modules/jszip": {
+      "version": "3.10.2",
+      "resolved": "https://registry.npmjs.org/jszip/-/jszip-3.10.2.tgz",
+      "integrity": "sha512-3l+rb15IOWtUhU0H5MFqES/T6Kh7abYwjosBey/vD6hDt8zoEffkSC5Ws5SGtgVw3gBx2NEbhTeSW1+kWkpyTQ==",
+      "license": "(MIT OR GPL-3.0-or-later)",
+      "dependencies": {
+        "lie": "~3.3.0",
+        "pako": "~1.0.2",
+        "readable-stream": "~2.3.6",
+        "setimmediate": "^1.0.5"
+      }
+    },
+    "node_modules/jszip/node_modules/readable-stream": {
+      "version": "2.3.8",
+      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-2.3.8.tgz",
+      "integrity": "sha512-8p0AUk4XODgIewSi0l8Epjs+EVnWiK7NoDIEGU0HhE7+ZyY8D1IMY7odu5lRrFXGg71L15KG8QrPmum45RTtdA==",
+      "license": "MIT",
+      "dependencies": {
+        "core-util-is": "~1.0.0",
+        "inherits": "~2.0.3",
+        "isarray": "~1.0.0",
+        "process-nextick-args": "~2.0.0",
+        "safe-buffer": "~5.1.1",
+        "string_decoder": "~1.1.1",
+        "util-deprecate": "~1.0.1"
+      }
+    },
+    "node_modules/jszip/node_modules/safe-buffer": {
+      "version": "5.1.2",
+      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.1.2.tgz",
+      "integrity": "sha512-Gd2UZBJDkXlY7GbJxfsE8/nvKkUEU1G38c1siN6QP6a9PT9MmHB8GnpscSmMJSoF8LOIrt8ud/wPtojys4G6+g==",
+      "license": "MIT"
+    },
+    "node_modules/jszip/node_modules/string_decoder": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.1.1.tgz",
+      "integrity": "sha512-n/ShnvDi6FHbbVfviro+WojiFzv+s8MPMHBczVePfUpDJLwoLT0ht1l4YwBCbi8pJAveEEdnkHyPyTP/mzRfwg==",
+      "license": "MIT",
+      "dependencies": {
+        "safe-buffer": "~5.1.0"
+      }
+    },
+    "node_modules/lie": {
+      "version": "3.3.0",
+      "resolved": "https://registry.npmjs.org/lie/-/lie-3.3.0.tgz",
+      "integrity": "sha512-UaiMJzeWRlEujzAuw5LokY1L5ecNQYZKfmyZ9L7wDHb/p5etKaxXhohBcrw0EYby+G/NA52vRSN4N39dxHAIwQ==",
+      "license": "MIT",
+      "dependencies": {
+        "immediate": "~3.0.5"
+      }
+    },
+    "node_modules/lodash": {
+      "version": "4.17.23",
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.23.tgz",
+      "integrity": "sha512-LgVTMpQtIopCi79SJeDiP0TfWi5CNEc/L/aRdTh3yIvmZXTnheWpKjSZhnvMl8iXbC1tFg9gdHHDMLoV7CnG+w==",
+      "license": "MIT"
+    },
+    "node_modules/mimic-response": {
+      "version": "3.1.0",
+      "resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-3.1.0.tgz",
+      "integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
+    "node_modules/minimalistic-assert": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/minimalistic-assert/-/minimalistic-assert-1.0.1.tgz",
+      "integrity": "sha512-UtJcAD4yEaGtjPezWuO9wC4nwUnVH/8/Im3yEHQP4b67cXlD/Qr9hdITCU1xDbSEXg2XKNaP8jsReV7vQd00/A==",
+      "license": "ISC"
+    },
+    "node_modules/minimist": {
+      "version": "1.2.8",
+      "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
+      "integrity": "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==",
+      "license": "MIT",
+      "funding": {
+        "url": "https://github.com/sponsors/ljharb"
+      }
+    },
+    "node_modules/minipass": {
+      "version": "7.1.3",
+      "resolved": "https://registry.npmjs.org/minipass/-/minipass-7.1.3.tgz",
+      "integrity": "sha512-tEBHqDnIoM/1rXME1zgka9g6Q2lcoCkxHLuc7ODJ5BxbP5d4c2Z5cGgtXAku59200Cx7diuHTOYfSBD8n6mm8A==",
+      "license": "BlueOak-1.0.0",
+      "engines": {
+        "node": ">=16 || 14 >=14.17"
+      }
+    },
+    "node_modules/minizlib": {
+      "version": "3.1.0",
+      "resolved": "https://registry.npmjs.org/minizlib/-/minizlib-3.1.0.tgz",
+      "integrity": "sha512-KZxYo1BUkWD2TVFLr0MQoM8vUUigWD3LlD83a/75BqC+4qE0Hb1Vo5v1FgcfaNXvfXzr+5EhQ6ing/CaBijTlw==",
+      "license": "MIT",
+      "dependencies": {
+        "minipass": "^7.1.2"
+      },
+      "engines": {
+        "node": ">= 18"
+      }
+    },
+    "node_modules/mkdirp-classic": {
+      "version": "0.5.3",
+      "resolved": "https://registry.npmjs.org/mkdirp-classic/-/mkdirp-classic-0.5.3.tgz",
+      "integrity": "sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==",
+      "license": "MIT"
+    },
+    "node_modules/nanoid": {
+      "version": "5.1.16",
+      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-5.1.16.tgz",
+      "integrity": "sha512-kVrnsrJqMR8+oLJnGEmSWw9BivK5mt7H3FZatVRjrc5wGqFYuBxX1yG7+A7Gi5AefkX6t/oCkizcQgpu0cY1dQ==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "bin": {
+        "nanoid": "bin/nanoid.js"
+      },
+      "engines": {
+        "node": "^18 || >=20"
+      }
+    },
+    "node_modules/napi-build-utils": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/napi-build-utils/-/napi-build-utils-2.0.0.tgz",
+      "integrity": "sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA==",
+      "license": "MIT"
+    },
+    "node_modules/ndarray": {
+      "version": "1.0.19",
+      "resolved": "https://registry.npmjs.org/ndarray/-/ndarray-1.0.19.tgz",
+      "integrity": "sha512-B4JHA4vdyZU30ELBw3g7/p9bZupyew5a7tX1Y/gGeF2hafrPaQZhgrGQfsvgfYbgdFZjYwuEcnaobeM/WMW+HQ==",
+      "license": "MIT",
+      "dependencies": {
+        "iota-array": "^1.0.0",
+        "is-buffer": "^1.0.2"
+      }
+    },
+    "node_modules/node-abi": {
+      "version": "3.101.0",
+      "resolved": "https://registry.npmjs.org/node-abi/-/node-abi-3.101.0.tgz",
+      "integrity": "sha512-bkb/RkuWCE64eWu1PCh3Fu2pGc9mKRs+kOE+FU2bGHRYlQa86/D321DSATV54AsCQMKz3/xSt9sRgraZTpqdhQ==",
+      "license": "MIT",
+      "dependencies": {
+        "semver": "^7.3.5"
+      },
+      "engines": {
+        "node": ">=10"
+      }
+    },
+    "node_modules/node-addon-api": {
+      "version": "6.1.0",
+      "resolved": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-6.1.0.tgz",
+      "integrity": "sha512-+eawOlIgy680F0kBzPUNFhMZGtJ1YmqM6l4+Crf4IkImjYrO/mqPwRMh352g23uIaQKFItcQ64I7KMaJxHgAVA==",
+      "license": "MIT"
+    },
+    "node_modules/once": {
+      "version": "1.4.0",
+      "resolved": "https://registry.npmjs.org/once/-/once-1.4.0.tgz",
+      "integrity": "sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==",
+      "license": "ISC",
+      "dependencies": {
+        "wrappy": "1"
+      }
+    },
+    "node_modules/onnxruntime-common": {
+      "version": "1.17.3",
+      "resolved": "https://registry.npmjs.org/onnxruntime-common/-/onnxruntime-common-1.17.3.tgz",
+      "integrity": "sha512-IkbaDelNVX8cBfHFgsNADRIq2TlXMFWW+nG55mwWvQT4i0NZb32Jf35Pf6h9yjrnK78RjcnlNYaI37w394ovMw==",
+      "license": "MIT"
+    },
+    "node_modules/onnxruntime-node": {
+      "version": "1.17.3",
+      "resolved": "https://registry.npmjs.org/onnxruntime-node/-/onnxruntime-node-1.17.3.tgz",
+      "integrity": "sha512-NtbN1pfApTSEjVq46LrJ396aPP2Gjhy+oYZi5Bu1leDXAEvVap/BQ8CZELiLs7z0UnXy3xjJW23HiB4P3//FIw==",
+      "hasInstallScript": true,
+      "license": "MIT",
+      "os": [
+        "win32",
+        "darwin",
+        "linux"
+      ],
+      "dependencies": {
+        "onnxruntime-common": "1.17.3",
+        "tar": "^7.0.1"
+      }
+    },
+    "node_modules/pako": {
+      "version": "1.0.11",
+      "resolved": "https://registry.npmjs.org/pako/-/pako-1.0.11.tgz",
+      "integrity": "sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==",
+      "license": "(MIT AND Zlib)"
+    },
+    "node_modules/playwright": {
+      "version": "1.63.0",
+      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.63.0.tgz",
+      "integrity": "sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "playwright-core": "1.63.0"
+      },
+      "bin": {
+        "playwright": "cli.js"
+      },
+      "engines": {
+        "node": ">=20"
+      }
+    },
+    "node_modules/playwright-core": {
+      "version": "1.63.0",
+      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.63.0.tgz",
+      "integrity": "sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==",
+      "license": "Apache-2.0",
+      "bin": {
+        "playwright-core": "cli.js"
+      },
+      "engines": {
+        "node": ">=20"
+      }
+    },
+    "node_modules/prebuild-install": {
+      "version": "7.1.3",
+      "resolved": "https://registry.npmjs.org/prebuild-install/-/prebuild-install-7.1.3.tgz",
+      "integrity": "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==",
+      "deprecated": "No longer maintained. Please contact the author of the relevant native addon; alternatives are available.",
+      "license": "MIT",
+      "dependencies": {
+        "detect-libc": "^2.0.0",
+        "expand-template": "^2.0.3",
+        "github-from-package": "0.0.0",
+        "minimist": "^1.2.3",
+        "mkdirp-classic": "^0.5.3",
+        "napi-build-utils": "^2.0.0",
+        "node-abi": "^3.3.0",
+        "pump": "^3.0.0",
+        "rc": "^1.2.7",
+        "simple-get": "^4.0.0",
+        "tar-fs": "^2.0.0",
+        "tunnel-agent": "^0.6.0"
+      },
+      "bin": {
+        "prebuild-install": "bin.js"
+      },
+      "engines": {
+        "node": ">=10"
+      }
+    },
+    "node_modules/prebuild-install/node_modules/chownr": {
+      "version": "1.1.4",
+      "resolved": "https://registry.npmjs.org/chownr/-/chownr-1.1.4.tgz",
+      "integrity": "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==",
+      "license": "ISC"
+    },
+    "node_modules/prebuild-install/node_modules/tar-fs": {
+      "version": "2.1.5",
+      "resolved": "https://registry.npmjs.org/tar-fs/-/tar-fs-2.1.5.tgz",
+      "integrity": "sha512-OboTd8mmMhZDNPV+UjQcK9yKAatXu2aJ+r1w4im1Otd4M4fl2hwvdoXUxIYHFTHWK/3y3FarBP70v3vwmGlOxw==",
+      "license": "MIT",
+      "dependencies": {
+        "chownr": "^1.1.1",
+        "mkdirp-classic": "^0.5.2",
+        "pump": "^3.0.0",
+        "tar-stream": "^2.1.4"
+      }
+    },
+    "node_modules/prebuild-install/node_modules/tar-stream": {
+      "version": "2.2.0",
+      "resolved": "https://registry.npmjs.org/tar-stream/-/tar-stream-2.2.0.tgz",
+      "integrity": "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==",
+      "license": "MIT",
+      "dependencies": {
+        "bl": "^4.0.3",
+        "end-of-stream": "^1.4.1",
+        "fs-constants": "^1.0.0",
+        "inherits": "^2.0.3",
+        "readable-stream": "^3.1.1"
+      },
+      "engines": {
+        "node": ">=6"
+      }
+    },
+    "node_modules/process-nextick-args": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/process-nextick-args/-/process-nextick-args-2.0.1.tgz",
+      "integrity": "sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag==",
+      "license": "MIT"
+    },
+    "node_modules/pump": {
+      "version": "3.0.4",
+      "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.4.tgz",
+      "integrity": "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA==",
+      "license": "MIT",
+      "dependencies": {
+        "end-of-stream": "^1.1.0",
+        "once": "^1.3.1"
+      }
+    },
+    "node_modules/rc": {
+      "version": "1.2.8",
+      "resolved": "https://registry.npmjs.org/rc/-/rc-1.2.8.tgz",
+      "integrity": "sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==",
+      "license": "(BSD-2-Clause OR MIT OR Apache-2.0)",
+      "dependencies": {
+        "deep-extend": "^0.6.0",
+        "ini": "~1.3.0",
+        "minimist": "^1.2.0",
+        "strip-json-comments": "~2.0.1"
+      },
+      "bin": {
+        "rc": "cli.js"
+      }
+    },
+    "node_modules/readable-stream": {
+      "version": "3.6.2",
+      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
+      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
+      "license": "MIT",
+      "dependencies": {
+        "inherits": "^2.0.3",
+        "string_decoder": "^1.1.1",
+        "util-deprecate": "^1.0.1"
+      },
+      "engines": {
+        "node": ">= 6"
+      }
+    },
+    "node_modules/safe-buffer": {
+      "version": "5.2.1",
+      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz",
+      "integrity": "sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT"
+    },
+    "node_modules/sax": {
+      "version": "1.6.1",
+      "resolved": "https://registry.npmjs.org/sax/-/sax-1.6.1.tgz",
+      "integrity": "sha512-42tBVwLWnaQvW5zc4HbZrTuWccECCZfBi92FDuwtqxasH+JbPB3/FOKb1m222K42R4WxuxzzMsTswfzgtSu64Q==",
+      "license": "BlueOak-1.0.0",
+      "engines": {
+        "node": ">=11.0.0"
+      }
+    },
+    "node_modules/semver": {
+      "version": "7.8.5",
+      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
+      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
+      "license": "ISC",
+      "bin": {
+        "semver": "bin/semver.js"
+      },
+      "engines": {
+        "node": ">=10"
+      }
+    },
+    "node_modules/setimmediate": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/setimmediate/-/setimmediate-1.0.5.tgz",
+      "integrity": "sha512-MATJdZp8sLqDl/68LfQmbP8zKPLQNV6BIZoIgrscFDQ+RsvK/BxeDQOgyxKKoh0y/8h3BqVFnCqQ/gd+reiIXA==",
+      "license": "MIT"
+    },
+    "node_modules/sharp": {
+      "version": "0.32.6",
+      "resolved": "https://registry.npmjs.org/sharp/-/sharp-0.32.6.tgz",
+      "integrity": "sha512-KyLTWwgcR9Oe4d9HwCwNM2l7+J0dUQwn/yf7S0EnTtb0eVS4RxO0eUSvxPtzT4F3SY+C4K6fqdv/DO27sJ/v/w==",
+      "hasInstallScript": true,
+      "license": "Apache-2.0",
+      "dependencies": {
+        "color": "^4.2.3",
+        "detect-libc": "^2.0.2",
+        "node-addon-api": "^6.1.0",
+        "prebuild-install": "^7.1.1",
+        "semver": "^7.5.4",
+        "simple-get": "^4.0.1",
+        "tar-fs": "^3.0.4",
+        "tunnel-agent": "^0.6.0"
+      },
+      "engines": {
+        "node": ">=14.15.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/simple-concat": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/simple-concat/-/simple-concat-1.0.1.tgz",
+      "integrity": "sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT"
+    },
+    "node_modules/simple-get": {
+      "version": "4.0.1",
+      "resolved": "https://registry.npmjs.org/simple-get/-/simple-get-4.0.1.tgz",
+      "integrity": "sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "decompress-response": "^6.0.0",
+        "once": "^1.3.1",
+        "simple-concat": "^1.0.0"
+      }
+    },
+    "node_modules/simple-swizzle": {
+      "version": "0.2.4",
+      "resolved": "https://registry.npmjs.org/simple-swizzle/-/simple-swizzle-0.2.4.tgz",
+      "integrity": "sha512-nAu1WFPQSMNr2Zn9PGSZK9AGn4t/y97lEm+MXTtUDwfP0ksAIX4nO+6ruD9Jwut4C49SB1Ws+fbXsm/yScWOHw==",
+      "license": "MIT",
+      "dependencies": {
+        "is-arrayish": "^0.3.1"
+      }
+    },
+    "node_modules/streamx": {
+      "version": "2.28.1",
+      "resolved": "https://registry.npmjs.org/streamx/-/streamx-2.28.1.tgz",
+      "integrity": "sha512-zEzXb0s5Cds7tqMH6rhZ05lcJydCWiQPEwiNngVqzsxCc962vLY4Uw+mW7od8kDH258k2Uz/JrOkdIAAhSh9VA==",
+      "license": "MIT",
+      "dependencies": {
+        "events-universal": "^1.0.0",
+        "fast-fifo": "^1.3.2",
+        "text-decoder": "^1.1.0"
+      }
+    },
+    "node_modules/string_decoder": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.3.0.tgz",
+      "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
+      "license": "MIT",
+      "dependencies": {
+        "safe-buffer": "~5.2.0"
+      }
+    },
+    "node_modules/strip-json-comments": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/strip-json-comments/-/strip-json-comments-2.0.1.tgz",
+      "integrity": "sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/tar": {
+      "version": "7.5.22",
+      "resolved": "https://registry.npmjs.org/tar/-/tar-7.5.22.tgz",
+      "integrity": "sha512-MFO/QzvtAOmJbkhOaCTvbGcFN9L9b+JunIsDwaKljSOdcLMea3NJ1k9Usz/rjdfSXTq4dfzfeS7W4p4YOAAHeA==",
+      "license": "BlueOak-1.0.0",
+      "dependencies": {
+        "@isaacs/fs-minipass": "^4.0.0",
+        "chownr": "^3.0.0",
+        "minipass": "^7.1.2",
+        "minizlib": "^3.1.0",
+        "yallist": "^5.0.0"
+      },
+      "engines": {
+        "node": ">=18"
+      }
+    },
+    "node_modules/tar-fs": {
+      "version": "3.1.3",
+      "resolved": "https://registry.npmjs.org/tar-fs/-/tar-fs-3.1.3.tgz",
+      "integrity": "sha512-/hU4AXnIdZu+Gvl1pk0oI5f5HxWsCJRtY2aFaJdk9VvyL48DWU6iU5WAIPG+wIi1YvWA6eTJvIviP/tMAZZNwQ==",
+      "license": "MIT",
+      "dependencies": {
+        "pump": "^3.0.0",
+        "tar-stream": "^3.1.5"
+      },
+      "optionalDependencies": {
+        "bare-fs": "^4.0.1",
+        "bare-path": "^3.0.0"
+      }
+    },
+    "node_modules/tar-stream": {
+      "version": "3.2.2",
+      "resolved": "https://registry.npmjs.org/tar-stream/-/tar-stream-3.2.2.tgz",
+      "integrity": "sha512-+8NeqHRjQWH9nYlwo2gamAMImZCVzI4UoEgDpWorBt9OEfppiZn+uSkskzQKPWIZyji/C8fpWO7u69G0DX0tbg==",
+      "license": "MIT",
+      "dependencies": {
+        "b4a": "^1.9.0",
+        "bare-fs": "^4.8.2",
+        "fast-fifo": "^1.3.2",
+        "streamx": "^2.28.1"
+      }
+    },
+    "node_modules/teex": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/teex/-/teex-1.0.1.tgz",
+      "integrity": "sha512-eYE6iEI62Ni1H8oIa7KlDU6uQBtqr4Eajni3wX7rpfXD8ysFx8z0+dri+KWEPWpBsxXfxu58x/0jvTVT1ekOSg==",
+      "license": "MIT",
+      "dependencies": {
+        "streamx": "^2.12.5"
+      }
+    },
+    "node_modules/text-decoder": {
+      "version": "1.2.7",
+      "resolved": "https://registry.npmjs.org/text-decoder/-/text-decoder-1.2.7.tgz",
+      "integrity": "sha512-vlLytXkeP4xvEq2otHeJfSQIRyWxo/oZGEbXrtEEF9Hnmrdly59sUbzZ/QgyWuLYHctCHxFF4tRQZNQ9k60ExQ==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "b4a": "^1.6.4"
+      }
+    },
+    "node_modules/tunnel-agent": {
+      "version": "0.6.0",
+      "resolved": "https://registry.npmjs.org/tunnel-agent/-/tunnel-agent-0.6.0.tgz",
+      "integrity": "sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "safe-buffer": "^5.0.1"
+      },
+      "engines": {
+        "node": "*"
+      }
+    },
+    "node_modules/undici-types": {
+      "version": "7.24.6",
+      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-7.24.6.tgz",
+      "integrity": "sha512-WRNW+sJgj5OBN4/0JpHFqtqzhpbnV0GuB+OozA9gCL7a993SmU+1JBZCzLNxYsbMfIeDL+lTsphD5jN5N+n0zg==",
+      "license": "MIT"
+    },
+    "node_modules/util-deprecate": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/util-deprecate/-/util-deprecate-1.0.2.tgz",
+      "integrity": "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==",
+      "license": "MIT"
+    },
+    "node_modules/wrappy": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+      "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==",
+      "license": "ISC"
+    },
+    "node_modules/xml": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/xml/-/xml-1.0.1.tgz",
+      "integrity": "sha512-huCv9IH9Tcf95zuYCsQraZtWnJvBtLVE0QHMOs8bWyZAFZNDcYjsPq1nEx8jKA9y+Beo9v+7OBPRisQTjinQMw==",
+      "license": "MIT"
+    },
+    "node_modules/xml-js": {
+      "version": "1.6.11",
+      "resolved": "https://registry.npmjs.org/xml-js/-/xml-js-1.6.11.tgz",
+      "integrity": "sha512-7rVi2KMfwfWFl+GpPg6m80IVMWXLRjO+PxTq7V2CDhoGak0wzYzFgUY2m4XJ47OGdXd8eLE8EmwfAmdjw7lC1g==",
+      "license": "MIT",
+      "dependencies": {
+        "sax": "^1.2.4"
+      },
+      "bin": {
+        "xml-js": "bin/cli.js"
+      }
+    },
+    "node_modules/yallist": {
+      "version": "5.0.0",
+      "resolved": "https://registry.npmjs.org/yallist/-/yallist-5.0.0.tgz",
+      "integrity": "sha512-YgvUTfwqyc7UXVMrB+SImsVYSmTS8X/tSrtdNZMImM+n7+QTriRXyXim0mBrTXNeqzVF0KWGgHPeiyViFFrNDw==",
+      "license": "BlueOak-1.0.0",
+      "engines": {
+        "node": ">=18"
+      }
+    },
+    "node_modules/zod": {
+      "version": "3.21.4",
+      "resolved": "https://registry.npmjs.org/zod/-/zod-3.21.4.tgz",
+      "integrity": "sha512-m46AKbrzKVzOzs/DZgVnG5H55N1sv1M8qZU3A8RIKbs3mrACDNeIOeilDymVb2HdmP8uwshOCF4uJ8uM9rCqJw==",
+      "license": "MIT",
+      "funding": {
+        "url": "https://github.com/sponsors/colinhacks"
+      }
+    }
+  }
+}
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ILDC session poster</title>
+<style>
+  /* ---------- Fonts (bundled locally, no internet needed) ---------- */
+  @font-face { font-family: Lato; font-weight: 400; src: url(/node_modules/@fontsource/lato/files/lato-latin-400-normal.woff2) format('woff2'); }
+  @font-face { font-family: Lato; font-weight: 700; src: url(/node_modules/@fontsource/lato/files/lato-latin-700-normal.woff2) format('woff2'); }
+  @font-face { font-family: Lato; font-weight: 900; src: url(/node_modules/@fontsource/lato/files/lato-latin-900-normal.woff2) format('woff2'); }
+  @font-face { font-family: Title; font-weight: 800; src: url(/node_modules/@fontsource/barlow/files/barlow-latin-800-normal.woff2) format('woff2'); }
+
+  /* ---------- One colour set per day (measured from the Canva design) ---------- */
+  :root { --ink: #2e2d58; --pill: #f5d5cb; --cal: #f17c9b; --pin: #909dda; }
+  body[data-colourway="purple"]  { --bg: #47438f; --fg: #ffffff; --title: #fff4e0; --conf: #ffffff; --circle: #e6d7ec; }
+  body[data-colourway="mustard"] { --bg: #b8aa48; --fg: #000000; --title: #000000; --conf: #ffffff; --circle: #ffde59; }
+  body[data-colourway="green"]   { --bg: #86bfa7; --fg: #000000; --title: #000000; --conf: #000000; --circle: #4e7376; }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1080px; height: 1350px; }
+  body { font-family: Lato, sans-serif; color: var(--fg); background: var(--bg); position: relative; overflow: hidden; }
+  .abs { position: absolute; }
+  #art { left: 0; top: 0; width: 1080px; height: 1350px; }
+
+  /* Header */
+  #conf-logo { left: 67px; top: 67px; width: 120px; height: 120px; border-radius: 50%; background: #fff; display: grid; place-items: center; overflow: hidden; }
+  #conf-logo img { width: 88%; height: 88%; object-fit: contain; }
+  #conf-divider { left: 212px; top: 80px; width: 2px; height: 98px; background: var(--conf); opacity: .8; }
+  #conf-name { left: 232px; top: 78px; font: 700 25.7px/1.2 Lato; letter-spacing: .13em; text-transform: uppercase; color: var(--conf); }
+
+  .kicker { font-weight: 700; letter-spacing: .4em; text-transform: uppercase; }
+  #session-no { left: 71px; top: 233px; font-size: 19.8px; }
+  #title { left: 66px; top: 268px; width: 620px; height: 150px; display: flex; align-items: flex-start;
+           font-family: Title; font-weight: 800; color: var(--title); line-height: .95; letter-spacing: -.01em; }
+
+  /* Date / place */
+  .meta { top: 430px; display: flex; align-items: center; gap: 10px; }
+  .meta .ico { width: 94px; height: 94px; border-radius: 50%; display: grid; place-items: center; flex: none; }
+  .meta .ico svg { width: 44px; height: 44px; }
+  .meta b { display: block; font: 700 25.2px/1.25 Lato; }
+  .meta span { font: 400 22px/1.25 Lato; }
+  #when { left: 68px; } #when .ico { background: var(--cal); }
+  #where-line { left: 444px; top: 430px; width: 2px; height: 91px; background: var(--fg); opacity: .55; }
+  #where { left: 463px; } #where .ico { background: var(--pin); }
+
+  /* Speakers */
+  #speakers-label { left: 75px; top: 602px; font-size: 28.7px; }
+  #speakers { left: 0; top: 679px; width: 1080px; display: flex; flex-direction: column; gap: 30px; }
+  .row { display: flex; justify-content: center; gap: 0; }
+  .sp { width: 196px; display: flex; flex-direction: column; align-items: center; }
+  .sp .ph { width: 146px; height: 146px; border-radius: 50%; overflow: hidden; position: relative; background: var(--circle); }
+  .sp .ph img { width: 100%; height: 100%; display: block; }
+  .sp .ph .ini { position: absolute; inset: 0; display: grid; place-items: center; font: 800 52px Title; color: var(--ink); opacity: .55; }
+  .sp .pill { margin-top: -10px; position: relative; width: 190px; min-height: 62px; background: var(--pill); color: var(--ink);
+              border-radius: 31px; padding: 9px 12px; text-align: center; display: flex; flex-direction: column; justify-content: center; }
+  /* Chair / moderator tag on top of the photo circle; nobody else gets a tag. */
+  .sp .ph-wrap { position: relative; }
+  .sp .tag { position: absolute; left: 50%; transform: translateX(-50%); z-index: 2; white-space: nowrap;
+             font: 900 12.5px/1 Lato; letter-spacing: .14em; text-transform: uppercase; padding: 6px 12px 5px; border-radius: 12px;
+             background: #fff; color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.18); }
+  .sp .tag.moderator { background: #9a2d50; color: #fff; }
+  body[data-tag="top"] .sp .tag { top: -11px; }
+  body[data-tag="photo"] .sp .tag { bottom: 40px; }
+  /* Group headings layout: one heading per role above its people, in place of "SPEAKERS". */
+  body[data-tag="groups"] #speakers-label { display: none; }
+  body[data-tag="groups"] #speakers { top: 600px; }
+  body[data-tag="groups"] .row { gap: 0; align-items: flex-start; }
+  .grp { display: flex; flex-direction: column; align-items: stretch; }
+  .grp + .grp { border-left: 2px solid color-mix(in srgb, var(--fg) 35%, transparent); }
+  .grp h3 { font: 700 20px/1 Lato; letter-spacing: .3em; text-transform: uppercase; text-align: center; color: var(--fg); margin: 0 0 24px; padding-top: 6px; }
+  .grp .people { display: flex; }
+  .sp .nm { font: 900 var(--nm, 18.7px) / 1.15 Lato; }
+  .sp .ds { font: 400 calc(var(--nm, 18.7px) * .82) / 1.18 Lato; margin-top: 3px; }
+  .sp .og { font: 700 calc(var(--nm, 18.7px) * .85) / 1.15 Lato; margin-top: 2px; }
+
+  /* Footer */
+  #footer { left: 0; top: 1243px; width: 1080px; height: 107px; background: #fff; display: flex; align-items: center; padding: 0 50px 0 56px; gap: 36px; }
+  #footer .kicker { font-size: 19.1px; letter-spacing: .15em; color: var(--ink); white-space: nowrap; flex: none; }
+  #logos { flex: 1; display: flex; align-items: center; justify-content: space-evenly; height: 100%; }
+  #logos img { display: block; }
+  #stamp { right: 10px; bottom: 4px; font: 400 8px Lato; color: #b9b6c9; }
+</style>
+</head>
+<body>
+<img id="art" class="abs" alt="">
+
+<div id="conf-logo" class="abs"></div>
+<div id="conf-divider" class="abs"></div>
+<div id="conf-name" class="abs">India Land &amp; Development<br>Conference<br>2026</div>
+
+<div id="session-no" class="abs kicker"></div>
+<div id="title" class="abs"><span></span></div>
+
+<div id="when" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="#1f1d3d" stroke-width="2.2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></div>
+  <div style="margin-left:10px"><b id="date"></b><span id="time"></span></div>
+</div>
+<div id="where-line" class="abs"></div>
+<div id="where" class="abs meta">
+  <div class="ico"><svg viewBox="0 0 24 24" fill="#1f1d3d"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg></div>
+  <div style="margin-left:10px"><b id="room"></b><span id="venue"></span></div>
+</div>
+
+<div id="speakers-label" class="abs kicker">Speakers</div>
+<div id="speakers" class="abs"></div>
+
+<div id="footer" class="abs"><div class="kicker">Session organised by</div><div id="logos"></div></div>
+<div id="stamp" class="abs"></div>
+
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const initials = n => n.replace(/^(Dr|Prof) /, '').split(/\s+/).filter(w => /^[A-Z]/i.test(w)).slice(0, 2).map(w => w[0].toUpperCase()).join('');
+const waitImages = () => Promise.all([...document.images].filter(i => i.src).map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })));
+function fit(el, box, max, min) {
+  let s = max; el.style.fontSize = s + 'px';
+  while ((box.scrollHeight > box.clientHeight + 1 || box.scrollWidth > box.clientWidth + 1) && s > min) { s -= 1; el.style.fontSize = s + 'px'; }
+}
+
+async function render(d) {
+  document.body.dataset.colourway = d.colourway || 'purple';
+  document.body.dataset.tag = d.tagPlace || 'top';
+  if (d.art) document.getElementById('art').src = d.art;
+  if (d.confLogo) document.getElementById('conf-logo').innerHTML = `<img src="${d.confLogo}">`;
+
+  document.getElementById('session-no').textContent = `Session ${d.sessionNo}`;
+  const t = document.querySelector('#title span'); t.textContent = d.title;
+  document.getElementById('date').textContent = d.date;
+  document.getElementById('time').textContent = d.time;
+  document.getElementById('room').textContent = d.room;
+  document.getElementById('venue').textContent = d.venue;
+
+  // Speakers: up to 5 in a row; 6–10 in two rows of the same circles.
+  const n = d.speakers.length, top = n > 5 ? Math.ceil(n / 2) : n;
+  const rows = n > 5 ? [d.speakers.slice(0, top), d.speakers.slice(top)] : [d.speakers];
+  const card = s => `
+    <div class="sp"><div class="ph-wrap"><div class="ph">${s.photo ? `<img src="${s.photo}">` : `<div class="ini">${esc(initials(s.name))}</div>`}</div>
+      ${s.role && document.body.dataset.tag !== 'groups' ? `<div class="tag${s.role === 'Moderator' ? ' moderator' : ''}">${esc(s.role)}</div>` : ''}</div>
+      <div class="pill"><div class="nm">${esc(s.name)}</div>${s.designation ? `<div class="ds">${esc(s.designation)}</div>` : ''}<div class="og">${esc(s.organisation)}</div></div></div>`;
+  if (document.body.dataset.tag === 'groups') {
+    // Moderator / chair gets its own heading; everyone else sits under "Speakers". No per-person tags.
+    const grpOf = s => s.role === 'Moderator' ? 'Moderator' : 'Speaker';
+    const plural = { Moderator: 'Moderators', Speaker: 'Speakers' };
+    const sorted = [...d.speakers].sort((a, b) => (grpOf(a) === 'Moderator' ? 0 : 1) - (grpOf(b) === 'Moderator' ? 0 : 1));
+    const rowsG = n > 5 ? [sorted.slice(0, top), sorted.slice(top)] : [sorted];
+    const count = g => sorted.filter(s => grpOf(s) === g).length;
+    document.getElementById('speakers').innerHTML = rowsG.map((r, ri) => {
+      const groups = []; r.forEach(s => { const g = groups[groups.length - 1]; if (g && g.role === grpOf(s)) g.list.push(s); else groups.push({ role: grpOf(s), list: [s] }); });
+      return `<div class="row">${groups.map(g => `<div class="grp">${ri === 0 ? `<h3>${esc(count(g.role) > 1 ? plural[g.role] : g.role)}</h3>` : ''}<div class="people">${g.list.map(card).join('')}</div></div>`).join('')}</div>`;
+    }).join('');
+  } else
+  document.getElementById('speakers').innerHTML = rows.map(r => `<div class="row">${r.map(s => `
+    <div class="sp"><div class="ph-wrap"><div class="ph">${s.photo ? `<img src="${s.photo}">` : `<div class="ini">${esc(initials(s.name))}</div>`}</div>
+      ${s.role === 'Moderator' || s.role === 'Chair' ? `<div class="tag moderator">${s.role}</div>` : ''}</div>
+      <div class="pill"><div class="nm">${esc(s.name)}</div>${s.designation ? `<div class="ds">${esc(s.designation)}</div>` : ''}<div class="og">${esc(s.organisation)}</div></div></div>`).join('')}</div>`).join('');
+
+  // Organiser logos: equal visual weight, capped size.
+  const logos = document.getElementById('logos');
+  const L = d.logos.length, avail = 1080 - 56 - 50 - 36 - 300, gap = 28, maxH = L <= 2 ? 70 : 60, maxW = L <= 2 ? 300 : 200;
+  let area = maxH * maxH * 1.7;
+  const dims = a => d.logos.map(l => { let h = Math.min(maxH, Math.sqrt(a / l.aspect)), w = h * l.aspect; if (w > maxW) { w = maxW; h = w / l.aspect; } return { w, h }; });
+  let ds = dims(area);
+  while (L && ds.reduce((s, x) => s + x.w, 0) + gap * (L - 1) > avail && area > 400) { area *= .92; ds = dims(area); }
+  logos.innerHTML = d.logos.map((l, i) => `<img src="${l.src}" alt="${esc(l.name)}" style="width:${ds[i].w.toFixed(1)}px;height:${ds[i].h.toFixed(1)}px">`).join('');
+  document.getElementById('stamp').textContent = d.stamp || '';
+
+  await document.fonts.ready;
+  await waitImages();
+  fit(t, document.getElementById('title'), 65, 40);
+  // Long names/organisations: shrink that pill's text so it stays a tidy pill.
+  document.querySelectorAll('.sp .pill').forEach(p => {
+    // Room under each circle: about 140 px of pill even with two rows of speakers.
+    let s = 18.7;
+    while (p.offsetHeight > 112 && s > 15.5) { s -= 0.5; p.style.setProperty('--nm', s + 'px'); }
+    if (p.offsetHeight > 140) p.dataset.overflow = '1';
+  });
+  return checks(d);
+}
+
+function checks(d) {
+  const w = [];
+  const t = document.getElementById('title'); if (t.scrollHeight > t.clientHeight + 2) w.push('Title too long even at smallest size');
+  document.querySelectorAll('.sp .pill[data-overflow]').forEach(p => w.push(`Text too long to fit: ${p.querySelector('.nm').textContent}`));
+  return w;
+}
+</script>
+</body>
+</html>
+
+// Programme agenda as a Word file: one table per day, the same columns as the ILDC 2025 agenda.
+// Built from Airtable on every run; paper titles and unregistered (TBC) speakers are added by hand afterwards.
+import fs from 'node:fs';
+import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, ShadingType, AlignmentType,
+  BorderStyle, PageOrientation, VerticalAlign, HeadingLevel } from 'docx';
+
+const FONT = 'Calibri';
+const INK = '2E2D58';
+// ILDC 2026 colours: each day's header in its poster colour, rows alternating a pale tint of it with the posters' cream.
+const DAY_STYLE = {
+  purple: { head: '47438F', text: 'FFFFFF', tint: 'E6D7EC' },
+  mustard: { head: 'B8AA48', text: '000000', tint: 'F3EDC4' },
+  green: { head: '86BFA7', text: '000000', tint: 'DCEEE6' },
+};
+const CREAM = 'FFF4E0';
+// Column widths in twentieths of a point (A4 portrait, 1.5 cm margins → about 10 200 wide).
+const COLS = [2500, 900, 1700, 2100, 3000];
+
+const run = (text, o = {}) => new TextRun({ text, font: FONT, size: o.size || 18, bold: o.bold, italics: o.italics, color: o.color || INK });
+const para = (runs, o = {}) => new Paragraph({ children: runs, spacing: { after: o.after ?? 0, before: o.before ?? 0 }, alignment: o.align });
+
+// "Name, Designation, Organisation" with the name in bold and the designation in italics, as last year.
+const person = p => {
+  const r = [run(p.docName || p.name, { bold: true })];
+  if (p.designation) r.push(run(', '), run(p.designation, { italics: true }));
+  if (p.organisation) r.push(run(', ' + p.organisation));
+  return r;
+};
+
+const cell = (children, width, fill, o = {}) => new TableCell({
+  children: children.length ? children : [para([run('-')])],
+  width: { size: width, type: WidthType.DXA },
+  shading: fill ? { type: ShadingType.CLEAR, color: 'auto', fill } : undefined,
+  verticalAlign: o.top ? VerticalAlign.TOP : VerticalAlign.CENTER,
+  margins: { top: 80, bottom: 80, left: 100, right: 100 },
+});
+
+function sessionRow(s, tint) {
+  // Chair / Moderator column: label each person only when the session has both kinds.
+  const both = s.chairs.length && s.moderators.length;
+  const lead = [];
+  for (const [label, list] of [['Chair', s.chairs], ['Moderator', s.moderators]]) {
+    list.forEach((p, i) => {
+      lead.push(para([...(both && i === 0 ? [run(label + ': ')] : []), ...person(p)], { before: lead.length && i === 0 ? 160 : 0 }));
+    });
+  }
+  // Speakers column: paper presenters get a marked line above them for the paper title.
+  const spk = [];
+  s.speakers.forEach((p, i) => {
+    if (p.role === 'Paper Presenter') spk.push(para([run('[Paper title]', { italics: true, color: '9A2D50' })], { before: i ? 160 : 0 }));
+    spk.push(para(person(p), { after: 60 }));
+  });
+  return new TableRow({ cantSplit: false, children: [
+    cell([para([run(s.title)])], COLS[0], tint),
+    cell([para([run(s.code)], { align: AlignmentType.CENTER })], COLS[1], tint),
+    cell(s.organisers.map(o => para([run(o)])), COLS[2], tint),
+    cell(lead, COLS[3], tint),
+    cell(spk, COLS[4], tint, { top: true }),
+  ] });
+}
+
+const header = st => new TableRow({ tableHeader: true, children: ['Session name', 'Session code', 'Session organiser', 'Chair/ Moderator', 'Speaker']
+  .map((t, i) => cell([para([run(t, { bold: true, color: st.text })], { align: AlignmentType.CENTER })], COLS[i], st.head)) });
+
+/**
+ * days: [{ label: 'Day 1 · Tuesday, 17 November', colour: 'purple', sessions: [{ code, title, organisers: [], chairs: [], moderators: [], speakers: [] }] }]
+ * stamp: human-readable time the file was made.
+ */
+export async function writeProgrammeDoc(file, days, stamp) {
+  const children = [
+    para([run('ILDC 2026 PROGRAMME AGENDA', { bold: true, size: 32 })], { align: AlignmentType.CENTER, after: 80 }),
+    para([run(`Generated from Airtable on ${stamp}. Paper titles and unregistered speakers are added by hand.`, { italics: true, size: 16, color: '6B6A85' })],
+      { align: AlignmentType.CENTER, after: 240 }),
+  ];
+  days.forEach((d, di) => {
+    const st = DAY_STYLE[d.colour] || DAY_STYLE.purple;
+    children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, pageBreakBefore: di > 0, alignment: AlignmentType.CENTER, spacing: { after: 160 },
+      shading: { type: ShadingType.CLEAR, color: 'auto', fill: st.head }, children: [run('  ' + d.label + '  ', { bold: true, size: 26, color: st.text })] }));
+    const border = { style: BorderStyle.SINGLE, size: 4, color: 'FFFFFF' };
+    children.push(new Table({
+      width: { size: COLS.reduce((a, b) => a + b), type: WidthType.DXA }, columnWidths: COLS,
+      borders: { top: border, bottom: border, left: border, right: border, insideHorizontal: border, insideVertical: border },
+      rows: [header(st), ...d.sessions.map((s, i) => sessionRow(s, i % 2 ? CREAM : st.tint))],
+    }));
+  });
+  const doc = new Document({
+    creator: 'ILDC poster builder', title: 'ILDC 2026 Programme Agenda',
+    sections: [{ properties: { page: { size: { orientation: PageOrientation.PORTRAIT, width: 11906, height: 16838 }, margin: { top: 850, bottom: 850, left: 850, right: 850 } } }, children }],
+  });
+  fs.writeFileSync(file, await Packer.toBuffer(doc));
+}
